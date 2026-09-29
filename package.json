@@ -1,0 +1,46 @@
+{
+  "name": "chalak-performance",
+  "private": true,
+  "version": "2.1.0",
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "build": "vite build",
+    "typecheck": "tsc --noEmit",
+    "lint": "npm run typecheck",
+    "test": "vitest run",
+    "test:e2e": "playwright test",
+    "check": "npm run typecheck && npm run test && npm run build",
+    "preview": "vite preview",
+    "cf:dev": "npm run build && wrangler pages dev dist",
+    "cf:functions": "wrangler pages functions build --outdir .wrangler/functions-build",
+    "deploy": "npm run typecheck && npm run build && wrangler pages deploy dist"
+  },
+  "dependencies": {
+    "@google/genai": "^2.18.0",
+    "@tailwindcss/vite": "^4.1.14",
+    "@types/d3": "^7.4.3",
+    "@vitejs/plugin-react": "^5.0.4",
+    "d3": "^7.9.0",
+    "exceljs": "^4.4.0",
+    "lucide-react": "^0.546.0",
+    "motion": "^12.23.24",
+    "react": "^19.0.1",
+    "react-dom": "^19.0.1",
+    "vite": "^6.2.3",
+    "zod": "^4.4.3"
+  },
+  "devDependencies": {
+    "@cloudflare/workers-types": "^5.20260914.1",
+    "@playwright/test": "^1.63.0",
+    "@types/node": "^22.14.0",
+    "autoprefixer": "^10.4.21",
+    "tailwindcss": "^4.1.14",
+    "typescript": "~5.8.2",
+    "vitest": "^5.0.2",
+    "wrangler": "^4.131.2"
+  },
+  "overrides": {
+    "uuid": "^11.1.0"
+  }
+}

@@ -1,0 +1,617 @@
+/**
+ * @license
+ * SPDX-License-Identifier: Apache-2.0
+ */
+
+@import url('https://fonts.googleapis.com/css2?family=Vazirmatn:wght@300;400;500;600;700;800;900&family=Inter:wght@300;400;500;600;700;800&display=swap');
+@import "tailwindcss";
+
+@custom-variant dark (&:where(.dark, .dark *));
+
+@theme {
+  --font-sans: "Vazirmatn", "Inter", system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+  --font-mono: "Fira Code", "Courier New", Courier, monospace;
+
+  /* Redefining teal palette to premium crimson and active red hues */
+  --color-teal-50: #fff5f5;
+  --color-teal-100: #fee2e2;
+  --color-teal-200: #fecaca;
+  --color-teal-300: #fca5a5;
+  --color-teal-400: #ef4444;
+  --color-teal-500: #dc2626;
+  --color-teal-600: #b91c1c;
+  --color-teal-700: #991b1b;
+  --color-teal-800: #7f1d1d;
+  --color-teal-900: #450a0a;
+  --color-teal-950: #2d0505;
+
+  /* Redefining indigo palette to elegant deep rose/crimson hues */
+  --color-indigo-50: #fff1f2;
+  --color-indigo-100: #ffe4e6;
+  --color-indigo-200: #fecdd3;
+  --color-indigo-300: #fda4af;
+  --color-indigo-400: #fb7185;
+  --color-indigo-500: #f43f5e;
+  --color-indigo-600: #e11d48;
+  --color-indigo-700: #be123c;
+  --color-indigo-800: #9f1239;
+  --color-indigo-900: #881337;
+  --color-indigo-950: #4c0519;
+}
+
+:root {
+  color-scheme: light;
+  --app-canvas: #f7f8fa;
+  --app-surface: #ffffff;
+  --app-surface-muted: #f1f5f9;
+  --app-border: #e2e8f0;
+  --app-heading: #0f172a;
+  --app-text: #334155;
+  --app-muted: #64748b;
+  --app-accent: #b91c1c;
+  --app-focus: #dc2626;
+}
+html.dark, html:not(.light-theme) {
+  color-scheme: dark;
+  --app-canvas: #0b1220;
+  --app-surface: #111a2b;
+  --app-surface-muted: #172235;
+  --app-border: #28364b;
+  --app-heading: #f1f5f9;
+  --app-text: #cbd5e1;
+  --app-muted: #94a3b8;
+  --app-accent: #ef4444;
+  --app-focus: #fca5a5;
+}
+button, input, select, textarea { font: inherit; }
+button:focus-visible, input:focus-visible, select:focus-visible, textarea:focus-visible { outline: 3px solid color-mix(in srgb, var(--app-focus) 55%, transparent); outline-offset: 2px; }
+.app-page { min-width: 0; animation: page-enter 180ms ease-out; }
+@keyframes page-enter { from { opacity: .72; transform: translateY(4px); } to { opacity: 1; transform: translateY(0); } }
+
+html, body {
+  font-family: var(--font-sans);
+  background-color: var(--app-canvas);
+  color: var(--app-text);
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+  text-rendering: optimizeLegibility;
+  font-feature-settings: "cv01", "ss01", "ss02";
+  transition: background-color 0.3s cubic-bezier(0.4, 0, 0.2, 1), color 0.3s cubic-bezier(0.4, 0, 0.2, 1);
+  overflow-x: hidden;
+  touch-action: manipulation;
+}
+
+/* Persian typography legibility helpers */
+h1, h2, h3, h4, h5, h6 {
+  letter-spacing: -0.02em;
+  line-height: 1.4;
+  text-wrap: balance;
+  text-shadow: none !important;
+}
+
+p, span, label, td, th {
+  line-height: 1.65;
+  text-shadow: none !important;
+}
+
+.tabular-nums {
+  font-variant-numeric: tabular-nums;
+}
+
+/* Responsive Table Scroll & Complete Shadow Overlap Elimination */
+.table-responsive {
+  width: 100%;
+  overflow-x: auto;
+  -webkit-overflow-scrolling: touch;
+  isolation: isolate;
+}
+
+/* Ensure no obscuring shadows, blurry drop-shadows, or overlapping bleed on table rows/cells */
+table, tr, td, th, .virtualized-row, .table-cell-content {
+  text-shadow: none !important;
+  box-shadow: none !important;
+}
+
+/* Clean isolation for table containers to prevent underlying shadows from bleeding over text */
+.virtualized-table-container,
+[role="table"],
+.table-container {
+  isolation: isolate;
+  contain: paint;
+}
+
+/* Ensure sticky table headers stay opaque and crisp above scrolling rows */
+thead, th, .sticky-header {
+  position: sticky;
+  top: 0;
+  z-index: 10;
+  backdrop-filter: none !important;
+}
+
+.virtualized-row {
+  box-shadow: none !important;
+  text-shadow: none !important;
+}
+
+.virtualized-row:hover {
+  background-color: rgba(30, 41, 59, 0.75) !important;
+}
+
+html.light-theme .virtualized-row:hover {
+  background-color: #f1f5f9 !important;
+}
+
+/* Clear z-index hierarchy and clean elevation for popovers, dropdowns & tooltips */
+.table-cell-content {
+  position: relative;
+  z-index: 1;
+}
+
+/* Sleek pulse animations */
+@keyframes softPulse {
+  0%, 100% { transform: scale(1); opacity: 1; }
+  50% { transform: scale(1.02); opacity: 0.95; }
+}
+
+.animate-soft-pulse {
+  animation: softPulse 2s infinite ease-in-out;
+}
+
+/* Custom styles for high-fidelity interactive scoring states */
+.score-btn {
+  transition: all 0.25s cubic-bezier(0.4, 0, 0.2, 1);
+}
+.score-btn:hover {
+  transform: translateY(-2px);
+  box-shadow: 0 4px 12px rgba(220, 38, 38, 0.15);
+}
+
+/* Custom scrollbar styling */
+::-webkit-scrollbar {
+  width: 5px;
+  height: 5px;
+}
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+::-webkit-scrollbar-thumb {
+  background: #475569;
+  border-radius: 99px;
+}
+::-webkit-scrollbar-thumb:hover {
+  background: #64748b;
+}
+
+html.light-theme ::-webkit-scrollbar-track {
+  background: #f8fafc;
+}
+html.light-theme ::-webkit-scrollbar-thumb {
+  background: #cbd5e1;
+}
+html.light-theme ::-webkit-scrollbar-thumb:hover {
+  background: #94a3b8;
+}
+
+/* ==========================================================================
+   Premium White & Red Light Theme Global Overrides
+   ========================================================================== */
+
+html.light-theme {
+  background-color: #f8fafc !important;
+  color: #0f172a !important;
+}
+
+html.light-theme body {
+  background-color: #f8fafc !important;
+  color: #0f172a !important;
+}
+
+/* Slate background overrides to bright elegant whites and light silvers */
+html.light-theme .bg-slate-950,
+html.light-theme .bg-slate-950\/90,
+html.light-theme .bg-slate-950\/70,
+html.light-theme .bg-slate-950\/60,
+html.light-theme .bg-slate-950\/40,
+html.light-theme .bg-slate-950\/85,
+html.light-theme .bg-slate-950\/80 {
+  background-color: #f1f5f9 !important;
+}
+
+html.light-theme .bg-slate-900,
+html.light-theme .bg-slate-900\/95,
+html.light-theme .bg-slate-900\/90,
+html.light-theme .bg-slate-900\/80,
+html.light-theme .bg-slate-900\/50,
+html.light-theme .bg-slate-900\/40,
+html.light-theme .bg-slate-900\/30,
+html.light-theme .bg-slate-900\/20,
+html.light-theme .bg-slate-900\/10,
+html.light-theme .bg-slate-900\/60 {
+  background-color: #ffffff !important;
+  border-color: #e2e8f0 !important;
+  box-shadow: 0 4px 20px -2px rgba(15, 23, 42, 0.04), 0 2px 6px -1px rgba(15, 23, 42, 0.02) !important;
+}
+
+html.light-theme .bg-slate-800,
+html.light-theme .bg-slate-800\/80,
+html.light-theme .bg-slate-800\/50,
+html.light-theme .bg-slate-800\/40,
+html.light-theme .bg-slate-800\/30,
+html.light-theme .bg-slate-800\/20 {
+  background-color: #f8fafc !important;
+  border-color: #e2e8f0 !important;
+}
+
+html.light-theme .bg-slate-950\/50 {
+  background-color: #f1f5f9 !important;
+}
+
+/* Text overrides */
+html.light-theme .text-slate-100,
+html.light-theme .text-slate-200,
+html.light-theme .text-slate-300 {
+  color: #0f172a !important;
+}
+
+html.light-theme .text-slate-400 {
+  color: #475569 !important;
+}
+
+html.light-theme .text-slate-500 {
+  color: #64748b !important;
+}
+
+/* Border overrides */
+html.light-theme .border-slate-800,
+html.light-theme .border-slate-800\/80,
+html.light-theme .border-slate-800\/60,
+html.light-theme .border-slate-800\/40,
+html.light-theme .border-slate-850,
+html.light-theme .border-slate-700,
+html.light-theme .border-slate-750,
+html.light-theme .border-slate-700\/50 {
+  border-color: #e2e8f0 !important;
+}
+
+/* Inputs, drop-downs, textareas */
+html.light-theme input,
+html.light-theme select,
+html.light-theme textarea {
+  background-color: #ffffff !important;
+  border-color: #cbd5e1 !important;
+  color: #0f172a !important;
+  box-shadow: 0 1px 2px 0 rgba(0, 0, 0, 0.05) !important;
+}
+
+html.light-theme input::placeholder {
+  color: #94a3b8 !important;
+}
+
+/* Bright Light Mode Brand Color Adjustments (Red/Rose emphasis) */
+html.light-theme .text-teal-400 {
+  color: #dc2626 !important;
+}
+
+html.light-theme .text-teal-300 {
+  color: #b91c1c !important;
+}
+
+html.light-theme .text-indigo-400 {
+  color: #e11d48 !important;
+}
+
+html.light-theme .text-indigo-300 {
+  color: #be123c !important;
+}
+
+html.light-theme .text-emerald-400 {
+  color: #16a34a !important;
+}
+
+html.light-theme .text-emerald-300 {
+  color: #166534 !important;
+}
+
+html.light-theme .text-rose-400 {
+  color: #dc2626 !important;
+}
+
+html.light-theme .text-rose-300 {
+  color: #be123c !important;
+}
+
+html.light-theme .text-amber-400 {
+  color: #ea580c !important;
+}
+
+/* Background overlay adjustments in light theme */
+html.light-theme .bg-teal-500\/10 {
+  background-color: rgba(220, 38, 38, 0.08) !important;
+}
+
+html.light-theme .bg-indigo-500\/10 {
+  background-color: rgba(225, 29, 72, 0.08) !important;
+}
+
+html.light-theme .bg-teal-500\/20 {
+  background-color: rgba(220, 38, 38, 0.15) !important;
+}
+
+html.light-theme .bg-indigo-500\/5 {
+  background-color: rgba(225, 29, 72, 0.04) !important;
+}
+
+html.light-theme .border-teal-500\/20 {
+  border-color: rgba(220, 38, 38, 0.15) !important;
+}
+
+html.light-theme .border-indigo-500\/10 {
+  border-color: rgba(225, 29, 72, 0.12) !important;
+}
+
+html.light-theme .bg-emerald-500\/10 {
+  background-color: rgba(22, 163, 74, 0.08) !important;
+}
+
+html.light-theme .border-emerald-500\/20 {
+  border-color: rgba(22, 163, 74, 0.15) !important;
+}
+
+html.light-theme .bg-rose-500\/5 {
+  background-color: rgba(220, 38, 38, 0.04) !important;
+}
+
+html.light-theme .border-rose-500\/10 {
+  border-color: rgba(220, 38, 38, 0.1) !important;
+}
+
+html.light-theme .bg-amber-500\/10 {
+  background-color: rgba(234, 88, 12, 0.08) !important;
+}
+
+html.light-theme .border-amber-500\/20 {
+  border-color: rgba(234, 88, 12, 0.15) !important;
+}
+
+/* The brand palette remaps teal and indigo to crimson. Legacy dark text on
+   those solid action surfaces is not legible in either color scheme. */
+:is(.bg-teal-500, .bg-indigo-500):is(.text-slate-900, .text-slate-950) {
+  color: #ffffff;
+}
+
+/* Keep the dark data-hub header legible when the surrounding app is in light mode. */
+html.light-theme .data-hub-header :is(.text-slate-100, .text-slate-200, .text-slate-300) {
+  color: #f8fafc !important;
+}
+
+html.light-theme .data-hub-header .text-slate-400 {
+  color: #cbd5e1 !important;
+}
+
+html.light-theme .data-hub-header .text-slate-600 {
+  color: #94a3b8 !important;
+}
+
+html.light-theme .data-hub-header .text-teal-300 {
+  color: #99f6e4 !important;
+}
+
+html.light-theme .data-hub-header .text-teal-400 {
+  color: #5eead4 !important;
+}
+
+html.light-theme .data-hub-header .text-indigo-400 {
+  color: #c7d2fe !important;
+}
+
+html.light-theme .data-hub-header .bg-teal-500\/10 {
+  background-color: rgba(20, 184, 166, 0.18) !important;
+}
+
+html.light-theme .data-hub-header .bg-teal-500\/20 {
+  background-color: rgba(20, 184, 166, 0.25) !important;
+}
+
+html.light-theme .data-hub-header .bg-slate-800 {
+  background-color: #1e293b !important;
+}
+
+html.light-theme .data-hub-header .hover\:bg-slate-700:hover {
+  background-color: #334155 !important;
+}
+
+/* Shared interaction and responsive tokens used across production screens. */
+:where(button, a, input, select, textarea, [tabindex]):focus-visible {
+  outline: 2px solid var(--app-focus);
+  outline-offset: 2px;
+}
+
+:where(button, input, select, textarea) {
+  font: inherit;
+}
+
+.workflow-tabs {
+  overscroll-behavior-inline: contain;
+  scrollbar-width: thin;
+  scrollbar-color: #64748b transparent;
+  scroll-padding-inline: 0.75rem;
+}
+
+.workflow-tabs > button {
+  min-height: 2.75rem;
+  scroll-snap-align: start;
+}
+
+.table-responsive,
+.table-container,
+.overflow-x-auto {
+  max-width: 100%;
+  overscroll-behavior-inline: contain;
+}
+
+@media (max-width: 640px) {
+  main,
+  main > div,
+  main section,
+  main article {
+    min-width: 0;
+  }
+
+  .workflow-tabs {
+    scroll-snap-type: x proximity;
+    -webkit-overflow-scrolling: touch;
+  }
+
+  .workflow-tabs > button {
+    flex: 0 0 auto;
+    max-width: min(82vw, 18rem);
+    white-space: nowrap;
+  }
+
+  .table-responsive table,
+  .table-container table,
+  .overflow-x-auto table {
+    min-width: 46rem;
+  }
+
+  input:not([type="checkbox"]):not([type="radio"]),
+  select,
+  textarea {
+    max-width: 100%;
+  }
+
+  input[type="checkbox"],
+  input[type="radio"] {
+    min-width: 1rem;
+    min-height: 1rem;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after {
+    scroll-behavior: auto !important;
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+  }
+}
+
+/* Print Optimization & High-Fidelity A4 PDF Export */
+@media print {
+  @page {
+    size: A4 portrait;
+    margin: 12mm 14mm 14mm 14mm;
+  }
+  aside, .no-print, header, nav {
+    display: none !important;
+  }
+  body, html {
+    background: #ffffff !important;
+    color: #0f172a !important;
+  }
+  main {
+    padding: 0 !important;
+    margin: 0 !important;
+    background: #ffffff !important;
+    color: #000000 !important;
+    overflow: visible !important;
+  }
+  #printable-manual-document {
+    width: 100% !important;
+    max-width: none !important;
+    box-shadow: none !important;
+    border: none !important;
+    padding: 0 !important;
+    margin: 0 !important;
+    display: block !important;
+  }
+  /* Avoid breaking inside sections or cards */
+  section, table, tr {
+    break-inside: avoid;
+    page-break-inside: avoid;
+  }
+  h1, h2, h3 {
+    break-after: avoid;
+    page-break-after: avoid;
+  }
+}
+
+/* Bell shaking animation for urgent notifications (> 5 pending items) */
+@keyframes bell-shake {
+  0% { transform: rotate(0deg); }
+  10% { transform: rotate(14deg) scale(1.05); }
+  20% { transform: rotate(-14deg) scale(1.05); }
+  30% { transform: rotate(10deg); }
+  40% { transform: rotate(-10deg); }
+  50% { transform: rotate(6deg); }
+  60% { transform: rotate(-6deg); }
+  70% { transform: rotate(2deg); }
+  80% { transform: rotate(-2deg); }
+  90% { transform: rotate(0deg); }
+  100% { transform: rotate(0deg); }
+}
+
+.animate-bell-shake {
+  display: inline-block;
+  transform-origin: top center;
+  animation: bell-shake 1.6s cubic-bezier(0.36, 0.07, 0.19, 0.97) infinite;
+}
+
+/* Shared application shell polish: additive classes used by App and Sidebar. */
+.app-shell {
+  --shell-radius: 1.25rem;
+  --shell-border: rgba(148, 163, 184, 0.18);
+}
+
+.app-sidebar {
+  box-shadow: 0 10px 28px rgba(15, 23, 42, 0.08);
+}
+
+.app-main {
+  scrollbar-gutter: stable;
+  background-color: var(--app-canvas);
+  color: var(--app-text);
+}
+
+.app-main .app-page h1 {
+  color: var(--app-heading);
+  font-size: clamp(1.35rem, 1.2rem + 0.75vw, 1.9rem);
+  font-weight: 750;
+  letter-spacing: -0.025em;
+  line-height: 1.35;
+}
+
+.app-content {
+  isolation: isolate;
+}
+
+.app-content > .max-w-7xl {
+  animation: shell-content-enter 180ms ease-out;
+}
+
+@keyframes shell-content-enter {
+  from { opacity: 0; transform: translateY(3px); }
+  to { opacity: 1; transform: translateY(0); }
+}
+
+html:not(.light-theme) .app-sidebar {
+  box-shadow: 0 12px 30px rgba(2, 6, 23, 0.24);
+}
+
+html.light-theme .app-sidebar {
+  box-shadow: 0 10px 26px rgba(15, 23, 42, 0.07);
+}
+
+@media (max-width: 767px) {
+  .app-content {
+    padding-bottom: 5.5rem;
+  }
+
+  .app-sidebar {
+    width: min(88vw, 22rem);
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .app-content > .max-w-7xl { animation: none; }
+}

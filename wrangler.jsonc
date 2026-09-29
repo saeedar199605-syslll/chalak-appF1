@@ -1,0 +1,16 @@
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "chalak-performance",
+  "compatibility_date": "2026-09-14",
+  "compatibility_flags": [
+    "nodejs_compat"
+  ],
+  "pages_build_output_dir": "./dist",
+  "upload_source_maps": true,
+  "kv_namespaces": [
+    {
+      "binding": "CHALAK_DB",
+      "id": "4f2179fbe74b4e379556b6fb53337f2e"
+    }
+  ]
+}
