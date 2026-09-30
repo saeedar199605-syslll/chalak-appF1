@@ -1,12 +1,15 @@
 import { AuthSession, CloudflareEnv, jsonResponse } from '../../cloudflare/auth';
 import { CloudState, sanitizeCloudState } from '../../cloudflare/syncState';
 import { canDelegate, canPerformWorkflowAction, isWithinSupervisorScope, workflowPermissionForTransition, type DelegationRecord } from '../../src/utils/workflowAuthorization';
-import { authorize, DEFAULT_GRANULAR_PERMISSION_POLICY, type GranularPermissionPolicy } from '../../src/utils/authorization';
+import { authorize, canImport, employeeWithinScope, DEFAULT_GRANULAR_PERMISSION_POLICY, type GranularPermissionPolicy } from '../../src/utils/authorization';
 import { validateEvaluationWrite } from '../../src/utils/workflowSecurity';
 import { resolveWorkflowAssignee } from '../../src/utils/workflowAssignee';
 import { getEmployeeDeletionBlockReason } from '../../src/utils/employeeDeletion';
 import { thresholdsFollowDirection, validManualScoreLimits } from '../../src/utils/criterionScoring';
-import { DEFAULT_ROUTE_RULES, type Criterion, type Employee, type Evaluation, type EvaluationRouteRule, type UserNotification, type WorkflowTransitionLog } from '../../src/types';
+import { DEFAULT_ROUTE_RULES, type Criterion, type Employee, type Evaluation, type EvaluationRouteRule, type JobProfile, type UserNotification, type WorkflowTransitionLog } from '../../src/types';
+import { getEvaluationPeriodId } from '../../src/utils/evaluationPeriod';
+import { isMasterDataSourceImportContext, isProtectedSourceImportContext, isSourceImportContext, type SourceImportContext } from '../../src/utils/sourceImports';
+import { normalizePersonnelCode } from '../../src/utils/personnelSearch';
 
 interface Context {
   request: Request;
@@ -25,6 +28,7 @@ interface StateEnvelope {
   state?: unknown;
   baseRevision?: unknown;
   clientId?: unknown;
+  sourceImport?: unknown;
 }
 
 const NON_ADMIN_WRITABLE_KEYS = new Set([
@@ -71,7 +75,7 @@ function allowedEmployeeIds(state: CloudState, session: AuthSession): Set<string
   for (const employee of employees) {
     if (['evaluations', 'workflow', 'cartable'].some(module =>
       authorize(actor, module as 'evaluations' | 'workflow' | 'cartable', 'view', employee, policy).allowed
-    )) allowed.add(employee.id);
+    ) || canImport(actor, 'mis', employee, policy).allowed || canImport(actor, 'kasra', employee, policy).allowed) allowed.add(employee.id);
   }
   return allowed;
 }
@@ -82,6 +86,10 @@ function isExplicitReassignment(evaluation: EvaluationRecord | undefined): boole
 
 function getEmployees(state: CloudState): Employee[] {
   return (Array.isArray(state.pe_employees) ? state.pe_employees : []) as Employee[];
+}
+
+function getProfiles(state: CloudState): JobProfile[] {
+  return (Array.isArray(state.pe_profiles) ? state.pe_profiles : []) as JobProfile[];
 }
 
 function getDelegations(state: CloudState): DelegationRecord[] {
@@ -284,8 +292,11 @@ function canAccessEvaluation(evaluation: EvaluationRecord, state: CloudState, se
   return !hasExplicitViewGrant;
 }
 
-function hasAuthorizedEvaluationChanges(current: CloudState, changes: CloudState, session: AuthSession): boolean {
+function hasAuthorizedEvaluationChanges(current: CloudState, changes: CloudState, session: AuthSession, sourceImport?: SourceImportContext): boolean {
   if (!validNotificationReadUpdates(changes, current, session)) return false;
+  if (sourceImport && isMasterDataSourceImportContext(sourceImport)) return validateMasterDataImport(current, changes, session, sourceImport);
+  if (sourceImport && isProtectedSourceImportContext(sourceImport) && Object.keys(changes).some(key => key !== 'pe_evaluations' && key !== 'pe_notifications')) return false;
+  const protectedSourceImport = sourceImport && isProtectedSourceImportContext(sourceImport) ? sourceImport : undefined;
   if (session.role === 'admin') {
     const oldAudit = JSON.stringify(current.pe_audit_logs || []);
     if ('pe_audit_logs' in changes && JSON.stringify(changes.pe_audit_logs) !== oldAudit) return false;
@@ -300,7 +311,7 @@ function hasAuthorizedEvaluationChanges(current: CloudState, changes: CloudState
     if (!Array.isArray(changes.pe_evaluations)) return true;
     const incomingIds = new Set((changes.pe_evaluations as Evaluation[]).map(item => item.id));
     if ([...byId.values()].some(item => !incomingIds.has(item.id) && (item.status === 'locked' || item.stage === 'completed'))) return false;
-    return (changes.pe_evaluations as Evaluation[]).every(incoming => validateEvaluationWrite(byId.get(incoming?.id), incoming, { actor, employees: getEmployees(current), criteria: (current.pe_criteria || []) as Criterion[], delegations: getDelegations(current), permissionPolicy: getPermissionPolicy(current), routeRules: getRouteRules(current) }) === null);
+    return (changes.pe_evaluations as Evaluation[]).every(incoming => validateEvaluationWrite(byId.get(incoming?.id), incoming, { actor, employees: getEmployees(current), criteria: (current.pe_criteria || []) as Criterion[], profiles: getProfiles(current), delegations: getDelegations(current), permissionPolicy: getPermissionPolicy(current), routeRules: getRouteRules(current), sourceImport: protectedSourceImport }) === null);
   }
   if (Object.keys(changes).some(key => !NON_ADMIN_WRITABLE_KEYS.has(key))) return false;
   const byId = new Map((Array.isArray(current.pe_evaluations) ? current.pe_evaluations as EvaluationRecord[] : []).map(item => [item.id, item]));
@@ -308,7 +319,7 @@ function hasAuthorizedEvaluationChanges(current: CloudState, changes: CloudState
   if (Array.isArray(changes.pe_evaluations) && (!actor || !(changes.pe_evaluations as Evaluation[]).every(incoming => {
     const existing = byId.get(incoming?.id) as Evaluation | undefined;
     return validateEvaluationWrite(existing, incoming, {
-      actor, employees: getEmployees(current), criteria: (current.pe_criteria || []) as Criterion[], delegations: getDelegations(current), permissionPolicy: getPermissionPolicy(current), routeRules: getRouteRules(current),
+      actor, employees: getEmployees(current), criteria: (current.pe_criteria || []) as Criterion[], profiles: getProfiles(current), delegations: getDelegations(current), permissionPolicy: getPermissionPolicy(current), routeRules: getRouteRules(current), sourceImport: protectedSourceImport,
     }) === null;
   }))) return false;
   const delegationsById = new Map(getDelegations(current).map(item => [item.id, item]));
@@ -318,21 +329,52 @@ function hasAuthorizedEvaluationChanges(current: CloudState, changes: CloudState
 }
 
 type SafeWriteDenialReason = 'workflow_owner_mismatch' | 'outside_scope' | 'stage_not_authorized' |
-  'mis_owned_value_tamper' | 'finalized_record_locked' | 'score_limit_exceeded' | 'invalid_criterion_configuration' | 'permission_denied';
+  'source_owned_value_read_only' | 'finalized_record_locked' | 'score_limit_exceeded' | 'invalid_criterion_configuration' | 'permission_denied' |
+  'kasra_import_not_authorized' | 'mis_import_not_authorized' | 'employee_import_not_authorized' | 'criteria_import_not_authorized' | 'source_import_invalid';
 
 function safeDenialReason(failure: string): SafeWriteDenialReason {
   if (failure === 'owner_change_requires_reassignment') return 'workflow_owner_mismatch';
-  if (failure === 'mis_value_read_only') return 'mis_owned_value_tamper';
+  if (failure === 'mis_value_read_only') return 'source_owned_value_read_only';
+  if (failure === 'kasra_import_not_authorized') return 'kasra_import_not_authorized';
+  if (failure === 'mis_import_not_authorized') return 'mis_import_not_authorized';
+  if (failure === 'employee_import_not_authorized') return 'employee_import_not_authorized';
+  if (failure === 'criteria_import_not_authorized') return 'criteria_import_not_authorized';
+  if (failure === 'source_import_invalid') return 'source_import_invalid';
   if (failure === 'completed_immutable') return 'finalized_record_locked';
   if (failure === 'score_limit_exceeded') return 'score_limit_exceeded';
   if (['score_stage_denied', 'invalid_transition', 'transition_missing_history', 'ceiling_exceeded'].includes(failure)) return 'stage_not_authorized';
   return 'permission_denied';
 }
 
-function diagnoseStateWriteDenial(current: CloudState, changes: CloudState, session: AuthSession): {
+function diagnoseStateWriteDenial(current: CloudState, changes: CloudState, session: AuthSession, sourceImport?: SourceImportContext): {
   reason: SafeWriteDenialReason;
   recordId?: string;
 } {
+  if (sourceImport && isMasterDataSourceImportContext(sourceImport)) {
+    const actor = getActor(current, session);
+    const importType = sourceImport.importType === 'EMPLOYEE' ? 'employee' : 'criteria';
+    const unauthorizedReason: SafeWriteDenialReason = sourceImport.importType === 'EMPLOYEE'
+      ? 'employee_import_not_authorized'
+      : 'criteria_import_not_authorized';
+    if (!actor || !canImport(actor, importType, undefined, getPermissionPolicy(current)).allowed) {
+      return { reason: unauthorizedReason };
+    }
+    if (sourceImport.importType === 'EMPLOYEE' && Array.isArray(changes.pe_employees)) {
+      const currentById = new Map(getEmployees(current).map(employee => [employee.id, employee]));
+      for (const employee of changes.pe_employees as Employee[]) {
+        const previous = currentById.get(employee?.id);
+        if (JSON.stringify(previous) === JSON.stringify(employee)) continue;
+        const scoped = canImport(actor, 'employee', previous || employee, getPermissionPolicy(current));
+        if (!scoped.allowed) return { reason: 'outside_scope' };
+      }
+      return { reason: 'source_import_invalid' };
+    }
+    if (sourceImport.importType === 'CRITERIA' && Array.isArray(changes.pe_criteria) &&
+        !(changes.pe_criteria as unknown[]).every(validCriterionScoringConfiguration)) {
+      return { reason: 'invalid_criterion_configuration' };
+    }
+    return { reason: 'source_import_invalid' };
+  }
   if (session.role === 'admin' && 'pe_criteria' in changes &&
       (!Array.isArray(changes.pe_criteria) || !(changes.pe_criteria as unknown[]).every(validCriterionScoringConfiguration))) {
     return { reason: 'invalid_criterion_configuration' };
@@ -346,9 +388,11 @@ function diagnoseStateWriteDenial(current: CloudState, changes: CloudState, sess
         actor,
         employees: getEmployees(current),
         criteria: (current.pe_criteria || []) as Criterion[],
+        profiles: getProfiles(current),
         delegations: getDelegations(current),
         permissionPolicy: getPermissionPolicy(current),
         routeRules: getRouteRules(current),
+        sourceImport: sourceImport && isProtectedSourceImportContext(sourceImport) ? sourceImport : undefined,
       });
       if (!failure) continue;
       if (failure === 'permission_denied' && existing) {
@@ -363,21 +407,27 @@ function diagnoseStateWriteDenial(current: CloudState, changes: CloudState, sess
   return { reason: 'permission_denied' };
 }
 
-function safeWriteDenialResponse(current: CloudState, changes: CloudState, session: AuthSession): Response {
-  const denial = diagnoseStateWriteDenial(current, changes, session);
+function safeWriteDenialResponse(current: CloudState, changes: CloudState, session: AuthSession, sourceImport?: SourceImportContext): Response {
+  const denial = diagnoseStateWriteDenial(current, changes, session, sourceImport);
   const messages: Record<SafeWriteDenialReason, string> = {
     workflow_owner_mismatch: 'این پرونده به مسئول دیگری واگذار شده است.',
     outside_scope: 'این پرونده خارج از محدوده دسترسی شماست.',
     stage_not_authorized: 'ثبت این تغییر در مرحله فعلی گردش کار مجاز نیست.',
-    mis_owned_value_tamper: 'مقدار خودکار و محافظت‌شده قابل ویرایش دستی نیست.',
+    source_owned_value_read_only: 'مقدار خودکار و محافظت‌شده قابل ویرایش دستی نیست.',
     finalized_record_locked: 'پرونده نهایی یا قفل‌شده قابل ویرایش نیست.',
     score_limit_exceeded: 'نمره واردشده خارج از بازه مجاز این معیار است.',
     invalid_criterion_configuration: 'محدوده نمره، هدف یا ترتیب آستانه‌های این معیار معتبر نیست.',
     permission_denied: 'برای ثبت این تغییر مجوز کافی وجود ندارد.',
+    kasra_import_not_authorized: 'مجوز درون‌ریزی کسری برای این کارمند یا محدوده وجود ندارد.',
+    mis_import_not_authorized: 'مجوز درون‌ریزی MIS برای این کارمند یا محدوده وجود ندارد.',
+    employee_import_not_authorized: 'مجوز درون‌ریزی اطلاعات پرسنلی برای این کاربر یا محدوده وجود ندارد.',
+    criteria_import_not_authorized: 'مجوز درون‌ریزی معیارها برای این کاربر وجود ندارد.',
+    source_import_invalid: 'داده درون‌ریزی با منبع، دوره یا معیار مجاز تطبیق ندارد.',
   };
   return jsonResponse({
     error: messages[denial.reason],
-    code: denial.reason === 'invalid_criterion_configuration' ? 'criterion_configuration_invalid' : 'evaluation_write_denied',
+    code: denial.reason === 'invalid_criterion_configuration' ? 'criterion_configuration_invalid' :
+      ['kasra_import_not_authorized', 'mis_import_not_authorized', 'employee_import_not_authorized', 'criteria_import_not_authorized', 'source_import_invalid'].includes(denial.reason) ? denial.reason : 'evaluation_write_denied',
     reason: denial.reason,
     ...(denial.recordId ? { recordId: denial.recordId } : {}),
     retryable: false,
@@ -424,6 +474,96 @@ function safeAdminMasterDataChanges(current: CloudState, changes: CloudState): b
   return true;
 }
 
+function validateMasterDataImport(
+  current: CloudState,
+  changes: CloudState,
+  session: AuthSession,
+  sourceImport: Extract<SourceImportContext, { importType: 'EMPLOYEE' | 'CRITERIA' }>,
+): boolean {
+  const key = sourceImport.importType === 'EMPLOYEE' ? 'pe_employees' : 'pe_criteria';
+  if (Object.keys(changes).some(name => name !== key && name !== 'pe_notifications')) return false;
+  const actor = getActor(current, session);
+  if (!actor) return false;
+  const type = sourceImport.importType === 'EMPLOYEE' ? 'employee' : 'criteria';
+  if (!canImport(actor, type, undefined, getPermissionPolicy(current)).allowed) return false;
+
+  if (sourceImport.importType === 'CRITERIA') {
+    const criteria = changes.pe_criteria;
+    if (!Array.isArray(criteria) || !criteria.every(validCriterionScoringConfiguration)) return false;
+    const ids = new Set<string>();
+    const codes = new Set<string>();
+    for (const criterion of criteria as Criterion[]) {
+      const code = String(criterion.code || '').trim().toLocaleUpperCase();
+      if (!criterion.id || !code || !String(criterion.name || '').trim() || typeof criterion.def !== 'string' ||
+          !['K', 'Q', 'B', 'S', 'L'].includes(criterion.cat) ||
+          (criterion.scoringSource !== undefined && !['supervisor', 'mis', 'kasra', 'system', 'multi_source'].includes(criterion.scoringSource)) ||
+          ids.has(criterion.id) || codes.has(code)) return false;
+      ids.add(criterion.id);
+      codes.add(code);
+    }
+    return safeAdminMasterDataChanges(current, changes);
+  }
+
+  const incoming = changes.pe_employees;
+  if (!Array.isArray(incoming)) return false;
+  const existingEmployees = getEmployees(current);
+  const existingById = new Map(existingEmployees.map(employee => [employee.id, employee]));
+  const validProfileIds = new Set(getProfiles(current).map(profile => profile.id));
+  const incomingIds = new Set<string>();
+  const codeOwners = new Map<string, string>();
+  const usernameOwners = new Map<string, string>();
+  for (const existing of existingEmployees) {
+    const code = normalizePersonnelCode(existing.code);
+    if (code) codeOwners.set(code, existing.id);
+    const username = String(existing.username || '').trim().toLocaleLowerCase();
+    if (username) usernameOwners.set(username, existing.id);
+  }
+  for (const employee of incoming as Employee[]) {
+    if (!employee || typeof employee.id !== 'string' || !employee.id || incomingIds.has(employee.id) ||
+        typeof employee.code !== 'string' || !normalizePersonnelCode(employee.code) ||
+        typeof employee.username !== 'string' || !employee.username.trim() || typeof employee.name !== 'string' || !employee.name.trim() ||
+        typeof employee.unit !== 'string' || typeof employee.profileId !== 'string' || !validProfileIds.has(employee.profileId) ||
+        !['admin', 'supervisor', 'employee'].includes(employee.role)) return false;
+    incomingIds.add(employee.id);
+    const old = existingById.get(employee.id);
+    const changed = !old || JSON.stringify(old) !== JSON.stringify(employee);
+    if (!changed) continue;
+    const permission = canImport(actor, 'employee', old || employee, getPermissionPolicy(current));
+    if (!permission.allowed || !permission.scope || !employeeWithinScope(actor, employee, permission.scope)) return false;
+    const code = normalizePersonnelCode(employee.code);
+    const codeOwner = codeOwners.get(code);
+    if (codeOwner && codeOwner !== employee.id) return false;
+    codeOwners.set(code, employee.id);
+    const username = employee.username.trim().toLocaleLowerCase();
+    const usernameOwner = usernameOwners.get(username);
+    if (usernameOwner && usernameOwner !== employee.id) return false;
+    usernameOwners.set(username, employee.id);
+    const allEmployeeIds = new Set([...existingEmployees.map(item => item.id), ...(incoming as Employee[]).map(item => item.id)]);
+    for (const relationId of [employee.supervisorId, employee.peerReviewerId, employee.calibrationLeadId, employee.approverId, employee.hrPartnerId, employee.hseReviewerId]) {
+      if (relationId && (!allEmployeeIds.has(relationId) || relationId === employee.id)) return false;
+    }
+
+    if (actor.role !== 'admin') {
+      if (old) {
+        for (const field of ['role', 'username', 'supervisorId', 'peerReviewerId', 'calibrationLeadId', 'approverId', 'hrPartnerId', 'hseReviewerId'] as const) {
+          if ((old[field] ?? '') !== (employee[field] ?? '')) return false;
+        }
+      } else if (employee.role !== 'employee' ||
+          employee.username !== `user_${code.toLocaleLowerCase()}` ||
+          (employee.supervisorId && employee.supervisorId !== actor.id) || employee.peerReviewerId ||
+          employee.calibrationLeadId || employee.approverId || employee.hrPartnerId || employee.hseReviewerId) return false;
+    }
+  }
+
+  // Non-admin imports receive a scoped employee projection, so merge those updates into
+  // the authoritative list and never interpret omitted out-of-scope rows as deletions.
+  // Admin imports carry the full list and may use the existing domain-safe replace rules.
+  const merged = new Map(existingEmployees.map(employee => [employee.id, employee]));
+  (incoming as Employee[]).forEach(employee => merged.set(employee.id, employee));
+  const finalEmployees = actor.role === 'admin' ? incoming as Employee[] : Array.from(merged.values());
+  return safeAdminMasterDataChanges(current, { ...changes, pe_employees: finalEmployees });
+}
+
 function scopedState(state: CloudState, session: AuthSession): CloudState {
   if (session.role === 'admin') return { ...state, pe_notifications: getNotifications(state).filter(item => item.recipientId === session.id) };
   const employees = Array.isArray(state.pe_employees) ? state.pe_employees as EmployeeRecord[] : [];
@@ -464,8 +604,78 @@ function scopedState(state: CloudState, session: AuthSession): CloudState {
   return sanitizeCloudState(result);
 }
 
-function mergeAuthorizedState(current: CloudState, changes: CloudState, session: AuthSession): CloudState {
+function mergeAuthorizedState(current: CloudState, changes: CloudState, session: AuthSession, sourceImport?: SourceImportContext): CloudState {
   const next = { ...current };
+  if (sourceImport && isMasterDataSourceImportContext(sourceImport)) {
+    const audit = Array.isArray(current.pe_audit_logs) ? [...current.pe_audit_logs as Array<Record<string, unknown>>] : [];
+    const timestamp = new Date().toISOString();
+    if (sourceImport.importType === 'EMPLOYEE' && Array.isArray(changes.pe_employees)) {
+      const oldEmployees = getEmployees(current);
+      const incoming = changes.pe_employees as Employee[];
+      const byId = new Map(oldEmployees.map(employee => [employee.id, employee]));
+      incoming.forEach(employee => byId.set(employee.id, employee));
+      const finalEmployees = session.role === 'admin'
+        ? incoming
+        : Array.from(byId.values());
+      const oldById = new Map(oldEmployees.map(employee => [employee.id, employee]));
+      const changed = finalEmployees.filter(employee => JSON.stringify(oldById.get(employee.id)) !== JSON.stringify(employee));
+      const removed = oldEmployees.filter(employee => !finalEmployees.some(nextEmployee => nextEmployee.id === employee.id));
+      next.pe_employees = finalEmployees;
+      changed.forEach(employee => audit.unshift({
+        id: `audit:employee_import:${sourceImport.operationId}:${employee.id}`,
+        timestamp, actorId: session.id, actorName: session.name, actorRole: session.role,
+        action: oldById.has(employee.id) ? 'employee_import_updated' : 'employee_import_created',
+        importType: sourceImport.importType, operationId: sourceImport.operationId,
+        target: employee.id, result: 'accepted',
+      }));
+      removed.forEach(employee => audit.unshift({
+        id: `audit:employee_import_removed:${sourceImport.operationId}:${employee.id}`,
+        timestamp, actorId: session.id, actorName: session.name, actorRole: session.role,
+        action: 'employee_import_removed', importType: sourceImport.importType,
+        operationId: sourceImport.operationId, target: employee.id, result: 'accepted',
+      }));
+      audit.unshift({
+        id: `audit:source_import:${sourceImport.operationId}`, timestamp,
+        actorId: session.id, actorName: session.name, actorRole: session.role,
+        action: 'source_import_completed', importType: sourceImport.importType,
+        operationId: sourceImport.operationId, affectedRecordCount: changed.length,
+        createdCount: changed.filter(employee => !oldById.has(employee.id)).length,
+        updatedCount: changed.filter(employee => oldById.has(employee.id)).length,
+        removedCount: removed.length, result: 'accepted',
+      });
+    } else if (sourceImport.importType === 'CRITERIA' && Array.isArray(changes.pe_criteria)) {
+      const oldCriteria = Array.isArray(current.pe_criteria) ? current.pe_criteria as Criterion[] : [];
+      const newCriteria = changes.pe_criteria as Criterion[];
+      const oldById = new Map(oldCriteria.map(criterion => [criterion.id, criterion]));
+      const newById = new Map(newCriteria.map(criterion => [criterion.id, criterion]));
+      const changed = newCriteria.filter(criterion => JSON.stringify(oldById.get(criterion.id)) !== JSON.stringify(criterion));
+      const removed = oldCriteria.filter(criterion => !newById.has(criterion.id));
+      next.pe_criteria = newCriteria;
+      changed.forEach(criterion => audit.unshift({
+        id: `audit:criteria_import:${sourceImport.operationId}:${criterion.id}`,
+        timestamp, actorId: session.id, actorName: session.name, actorRole: session.role,
+        action: oldById.has(criterion.id) ? 'criteria_import_updated' : 'criteria_import_created',
+        importType: sourceImport.importType, operationId: sourceImport.operationId,
+        target: criterion.id, result: 'accepted',
+      }));
+      removed.forEach(criterion => audit.unshift({
+        id: `audit:criteria_import_removed:${sourceImport.operationId}:${criterion.id}`,
+        timestamp, actorId: session.id, actorName: session.name, actorRole: session.role,
+        action: 'criteria_import_removed', importType: sourceImport.importType,
+        operationId: sourceImport.operationId, target: criterion.id, result: 'accepted',
+      }));
+      audit.unshift({
+        id: `audit:source_import:${sourceImport.operationId}`, timestamp,
+        actorId: session.id, actorName: session.name, actorRole: session.role,
+        action: 'source_import_completed', importType: sourceImport.importType,
+        operationId: sourceImport.operationId, affectedRecordCount: changed.length,
+        createdCount: changed.filter(criterion => !oldById.has(criterion.id)).length,
+        updatedCount: changed.filter(criterion => oldById.has(criterion.id)).length,
+        removedCount: removed.length, result: 'accepted',
+      });
+    }
+    next.pe_audit_logs = audit.slice(0, 10_000);
+  }
   if (Array.isArray(changes.pe_evaluations)) {
     const currentEvaluations = Array.isArray(current.pe_evaluations) ? current.pe_evaluations as EvaluationRecord[] : [];
     const currentById = new Map(currentEvaluations.map(item => [item.id, item]));
@@ -478,7 +688,10 @@ function mergeAuthorizedState(current: CloudState, changes: CloudState, session:
     const notificationEventKeys = new Set(notifications.map(item => item.eventKey));
     const employeeIds = new Set(getEmployees(current).map(employee => employee.id));
     const audit = Array.isArray(current.pe_audit_logs) ? [...current.pe_audit_logs as Array<Record<string, unknown>>] : [];
-    if (session.role === 'admin') {
+    // Protected imports carry only the evaluations changed by that source batch.
+    // Treating the partial batch as a full Admin replacement would delete every
+    // unrelated open evaluation omitted from the import payload.
+    if (session.role === 'admin' && !(sourceImport && isProtectedSourceImportContext(sourceImport))) {
       const retainedIds = new Set((changes.pe_evaluations as EvaluationRecord[]).map(item => item.id));
       for (const existing of currentEvaluations) {
         if (retainedIds.has(existing.id)) continue;
@@ -511,6 +724,61 @@ function mergeAuthorizedState(current: CloudState, changes: CloudState, session:
       }
       audit.unshift({ id: `audit:${item.id}:${log?.id || (existing ? `edit:${crypto.randomUUID()}` : 'created')}`, timestamp: new Date().toISOString(), actorId: session.id, actorName: session.name, actorRole: session.role, action: log?.action || (existing ? (scoreChanges.length && item.bulkOperationId ? 'bulk_score' : 'evaluation_updated') : 'evaluation_started'), target: item.id, bulkOperationId: item.bulkOperationId, previousState: before, resultingState: after, result: 'accepted' });
     });
+    if (sourceImport && isProtectedSourceImportContext(sourceImport)) {
+      const importedEvaluations = incoming.filter(item => {
+        const before = currentById.get(item.id) as Evaluation | undefined;
+        const updated = item as Evaluation;
+        return Boolean(before && before.empId === updated.empId &&
+          updated.scores.some(score => before.scores.some(previous => previous.cid === score.cid && JSON.stringify(previous) !== JSON.stringify(score))));
+      }) as Evaluation[];
+      const timestamp = new Date().toISOString();
+      const employeeIds = new Set(importedEvaluations.map(item => item.empId));
+      const scoreAudits: Array<Record<string, unknown>> = [];
+      for (const updated of importedEvaluations) {
+        const before = currentById.get(updated.id) as Evaluation | undefined;
+        if (!before) continue;
+        const previousScores = new Map(before.scores.map(score => [score.cid, score]));
+        for (const nextScore of updated.scores) {
+          const previousScore = previousScores.get(nextScore.cid);
+          if (!previousScore || JSON.stringify(previousScore) === JSON.stringify(nextScore)) continue;
+          scoreAudits.push({
+            id: `audit:source_import_score:${sourceImport.operationId}:${updated.id}:${nextScore.cid}`,
+            timestamp,
+            actorId: session.id,
+            actorName: session.name,
+            actorRole: session.role,
+            action: 'source_import_score_updated',
+            importType: sourceImport.importType,
+            operationId: sourceImport.operationId,
+            evaluationPeriodId: sourceImport.evaluationPeriodId,
+            employeeId: updated.empId,
+            evaluationId: updated.id,
+            criterionId: nextScore.cid,
+            previousValue: previousScore.value,
+            newValue: nextScore.value,
+            previousRawMetricValue: previousScore.rawMetricValue ?? null,
+            rawMetricValue: nextScore.rawMetricValue ?? null,
+            provenance: { sourceType: nextScore.sourceType, rawMetricLabel: nextScore.rawMetricLabel ?? null },
+            result: 'accepted',
+          });
+        }
+      }
+      audit.unshift({
+        id: `audit:source_import:${sourceImport.operationId}`,
+        timestamp,
+        actorId: session.id,
+        actorName: session.name,
+        actorRole: session.role,
+        action: 'source_import_completed',
+        importType: sourceImport.importType,
+        operationId: sourceImport.operationId,
+        evaluationPeriodId: sourceImport.evaluationPeriodId,
+        affectedEvaluationCount: importedEvaluations.length,
+        affectedEmployeeCount: employeeIds.size,
+        result: 'accepted',
+      });
+      audit.unshift(...scoreAudits);
+    }
     next.pe_evaluations = Array.from(byId.values());
     next.pe_notifications = notifications.slice(0, 10_000);
     next.pe_audit_logs = audit.slice(0, 10_000);
@@ -668,8 +936,22 @@ export async function onRequestPost({ request, env, data }: Context): Promise<Re
   try { body = JSON.parse(text) as StateEnvelope; }
   catch { return jsonResponse({ error: 'Invalid JSON payload.' }, 400); }
 
+  if (body.sourceImport !== undefined && !isSourceImportContext(body.sourceImport)) {
+    return jsonResponse({ error: 'Invalid protected import context.', code: 'source_import_invalid', reason: 'source_import_invalid', retryable: false }, 400);
+  }
+  const sourceImport = body.sourceImport as SourceImportContext | undefined;
+
   const changes = sanitizeCloudState(body.state === undefined ? body : body.state);
   if (Object.keys(changes).length === 0) return jsonResponse({ error: 'No synchronized changes were supplied.' }, 400);
+  if (sourceImport && isProtectedSourceImportContext(sourceImport) && !Array.isArray(changes.pe_evaluations)) {
+    return jsonResponse({ error: 'Protected imports require evaluation updates.', code: 'source_import_invalid', reason: 'source_import_invalid', retryable: false }, 400);
+  }
+  if (sourceImport && isMasterDataSourceImportContext(sourceImport)) {
+    const requiredKey = sourceImport.importType === 'EMPLOYEE' ? 'pe_employees' : 'pe_criteria';
+    if (!Array.isArray(changes[requiredKey])) {
+      return jsonResponse({ error: 'Master-data imports require their target records.', code: 'source_import_invalid', reason: 'source_import_invalid', retryable: false }, 400);
+    }
+  }
   const nonAdminSystemLogsOnly = data.session.role !== 'admin' &&
     Object.keys(changes).every(key => key === 'pe_system_logs');
   if (data.session.role !== 'admin') delete changes.pe_system_logs;
@@ -688,21 +970,21 @@ export async function onRequestPost({ request, env, data }: Context): Promise<Re
   // as authoritative; acknowledge a logs-only sync without persisting or bumping revision.
   if (nonAdminSystemLogsOnly) return responseEnvelope(current, currentMeta, data.session);
   const canonicalChanges = resolveTransitionOwners(current, changes, data.session);
-  if (!hasAuthorizedEvaluationChanges(current, canonicalChanges, data.session)) {
-    return safeWriteDenialResponse(current, canonicalChanges, data.session);
+  if (!hasAuthorizedEvaluationChanges(current, canonicalChanges, data.session, sourceImport)) {
+    return safeWriteDenialResponse(current, canonicalChanges, data.session, sourceImport);
   }
   if (Array.isArray(canonicalChanges.pe_evaluations)) {
     const existing = new Map((Array.isArray(current.pe_evaluations) ? current.pe_evaluations as Evaluation[] : []).map(item => [item.id, item]));
     const ids = new Set<string>();
-    const periodEmployees = new Set((Array.isArray(current.pe_evaluations) ? current.pe_evaluations as Evaluation[] : []).map(item => `${item.empId}\u0000${item.period}`));
+    const periodEmployees = new Set((Array.isArray(current.pe_evaluations) ? current.pe_evaluations as Evaluation[] : []).map(item => `${item.empId}\u0000${getEvaluationPeriodId(item)}`));
     for (const item of canonicalChanges.pe_evaluations as Evaluation[]) {
       const old = existing.get(item.id);
-      if (!old && (ids.has(item.id) || periodEmployees.has(`${item.empId}\u0000${item.period}`))) return jsonResponse({ error: 'An evaluation already exists for this employee and period.' }, 409);
+      if (!old && (ids.has(item.id) || periodEmployees.has(`${item.empId}\u0000${getEvaluationPeriodId(item)}`))) return jsonResponse({ error: 'An evaluation already exists for this employee and period.' }, 409);
       ids.add(item.id);
-      periodEmployees.add(`${item.empId}\u0000${item.period}`);
+      periodEmployees.add(`${item.empId}\u0000${getEvaluationPeriodId(item)}`);
     }
   }
-  const next = mergeAuthorizedState(current, canonicalChanges, data.session);
+  const next = mergeAuthorizedState(current, canonicalChanges, data.session, sourceImport);
   const meta: StateMeta = {
     revision: currentMeta.revision + 1,
     updatedAt: new Date().toISOString(),

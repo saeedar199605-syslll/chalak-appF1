@@ -14,6 +14,7 @@ import { SEED_CRITERIA, SEED_PROFILES, SEED_EMPLOYEES, SEED_EVALUATIONS } from '
 import { INITIAL_OKRS, INITIAL_ONE_ON_ONES, INITIAL_KUDOS } from '../data/latticeKickidlerSeed';
 import { CLOUD_SYNC_KEYS, CloudState, isCloudSyncKey } from '../../cloudflare/syncState';
 import { DelegationRecord } from './workflowAuthorization';
+import type { MasterDataSourceImportContext, ProtectedSourceImportContext, SourceImportContext } from './sourceImports';
 import { planEmployeeBulkDeletion } from './employeeDeletion';
 import { CLOUD_SYNC_MAX_RETRIES, CLOUD_SYNC_POLL_INTERVAL_MS, cloudWriteFingerprint, getCloudRetryDelay, isCurrentSyncGeneration, isSameRejectedSnapshot, isTerminalCloudWriteStatus, selectCloudSyncOperation, shouldAttemptSync, shouldRetryCloudStatus, shouldScheduleCloudSyncFollowup } from '../../cloudflare/syncPolicy';
 
@@ -227,7 +228,7 @@ export class AppDatabase {
   }
 
   // Safe JSON setter with synchronous notification
-  private setItem<T>(key: string, value: T): void {
+  private setItem<T>(key: string, value: T, scheduleSync = true): void {
     try {
       const stringVal = JSON.stringify(value);
       const currentVal = localStorage.getItem(key);
@@ -237,7 +238,7 @@ export class AppDatabase {
       this.notifyChange(key, value);
       if (this.cloudSyncEnabled && isCloudSyncKey(key)) {
         this.dirtyKeys.add(key);
-        this.triggerCloudSyncDebounced();
+        if (scheduleSync) this.triggerCloudSyncDebounced();
       }
     } catch (e) {
       console.error(`Error saving ${key} to storage:`, e);
@@ -586,6 +587,52 @@ export class AppDatabase {
     this.setItem(STORAGE_KEYS.EVALUATIONS, evaluations);
   }
 
+  /** Save one audited protected-source batch and wait for the Pages/KV decision. */
+  private async saveStateWithSourceImport(key: string, value: unknown, sourceImport: SourceImportContext): Promise<boolean> {
+    if (!this.cloudSyncEnabled || this.pendingSourceImportContext) return false;
+    let waitCount = 0;
+    while (this.isSyncing && waitCount < 1_600) {
+      await new Promise(resolve => setTimeout(resolve, 10));
+      waitCount++;
+    }
+    if (!this.cloudSyncEnabled || this.isSyncing || this.pendingSourceImportContext) return false;
+    const previousRaw = localStorage.getItem(key);
+    const previousDirty = this.dirtyKeys.has(key);
+    const nextRaw = JSON.stringify(value);
+    if (previousRaw === nextRaw) return false;
+    this.pendingSourceImportContext = sourceImport;
+    this.terminalRejectedSnapshot = null;
+    this.setItem(key, value, false);
+    if (localStorage.getItem(key) !== nextRaw) {
+      this.pendingSourceImportContext = null;
+      return false;
+    }
+    const saved = await this.pushStateToCloud([key]);
+    if (saved) return true;
+
+    if (this.pendingSourceImportContext?.operationId === sourceImport.operationId) this.pendingSourceImportContext = null;
+    if (localStorage.getItem(key) === nextRaw) {
+      if (previousRaw === null) localStorage.removeItem(key);
+      else localStorage.setItem(key, previousRaw);
+      if (previousDirty) this.dirtyKeys.add(key);
+      else if (previousRaw === this.lastSyncedValues.get(key)) this.dirtyKeys.delete(key);
+      else if (previousRaw !== null) this.dirtyKeys.add(key);
+    }
+    return false;
+  }
+
+  public saveEvaluationsWithSourceImport(evaluations: Evaluation[], sourceImport: ProtectedSourceImportContext): Promise<boolean> {
+    return this.saveStateWithSourceImport(STORAGE_KEYS.EVALUATIONS, evaluations, sourceImport);
+  }
+
+  public saveEmployeesWithSourceImport(employees: Employee[], sourceImport: MasterDataSourceImportContext): Promise<boolean> {
+    return this.saveStateWithSourceImport(STORAGE_KEYS.EMPLOYEES, employees, sourceImport);
+  }
+
+  public saveCriteriaWithSourceImport(criteria: Criterion[], sourceImport: MasterDataSourceImportContext): Promise<boolean> {
+    return this.saveStateWithSourceImport(STORAGE_KEYS.CRITERIA, criteria, sourceImport);
+  }
+
   public deleteEvaluation(id: string): boolean {
     const evals = this.getEvaluations();
     const target = evals.find(e => e.id === id);
@@ -768,7 +815,7 @@ export class AppDatabase {
   }
 
   // --- BATCH CRITERIA MERGE / MULTI-SOURCE REGISTER ---
-  public saveCriteriaBatch(
+  public prepareCriteriaBatch(
     newCriteria: Array<Omit<Criterion, 'id'> & { id?: string }>,
     mode: 'merge' | 'replace' | 'skip_existing' = 'merge'
   ): { addedCount: number; updatedCount: number; totalCount: number; criteria: Criterion[] } {
@@ -782,7 +829,6 @@ export class AppDatabase {
         id: c.id || `crit-${Date.now()}-${idx}-${Math.random().toString(36).substring(2, 5)}`,
         code: c.code.trim().toUpperCase()
       } as Criterion));
-      this.saveCriteria(formatted);
       return { addedCount: formatted.length, updatedCount: 0, totalCount: formatted.length, criteria: formatted };
     }
 
@@ -817,8 +863,16 @@ export class AppDatabase {
       }
     });
 
-    this.saveCriteria(updatedList);
     return { addedCount, updatedCount, totalCount: updatedList.length, criteria: updatedList };
+  }
+
+  public saveCriteriaBatch(
+    newCriteria: Array<Omit<Criterion, 'id'> & { id?: string }>,
+    mode: 'merge' | 'replace' | 'skip_existing' = 'merge'
+  ): { addedCount: number; updatedCount: number; totalCount: number; criteria: Criterion[] } {
+    const result = this.prepareCriteriaBatch(newCriteria, mode);
+    this.saveCriteria(result.criteria);
+    return result;
   }
 
   // --- CLOUD & CLOUDFLARE SYNC (Safe & Non-Destructive) ---
@@ -842,6 +896,7 @@ export class AppDatabase {
   private restoredPendingBaseRevision: number | null = null;
   private visibilityHandler: (() => void) | null = null;
   private onlineHandler: (() => void) | null = null;
+  private pendingSourceImportContext: SourceImportContext | null = null;
   
   public async initializeCloudSync(userId?: string): Promise<void> {
     if (userId) {
@@ -1060,7 +1115,7 @@ export class AppDatabase {
     }
   }
 
-  private async runSyncCycle(mode: 'pull' | 'push' | 'auto', forceAll = false, explicitRetry = false): Promise<boolean | null> {
+  private async runSyncCycle(mode: 'pull' | 'push' | 'auto', forceAll = false, explicitRetry = false, onlyKeys?: string[]): Promise<boolean | null> {
     if (this.isSyncing) return null;
     this.isSyncing = true;
     this.detectDirectStorageChanges();
@@ -1072,7 +1127,7 @@ export class AppDatabase {
         const operation = selectCloudSyncOperation(this.hasRevisionConflict, this.dirtyKeys.size);
         return operation === 'push' ? await this.pushStateToCloudInternal(false, true, explicitRetry) : await this.pullFromCloud();
       }
-      if (mode === 'push') return this.pushStateToCloudInternal(forceAll, true, explicitRetry);
+      if (mode === 'push') return this.pushStateToCloudInternal(forceAll, true, explicitRetry, onlyKeys);
       return this.pullFromCloud();
     } finally {
       this.isSyncing = false;
@@ -1254,12 +1309,12 @@ export class AppDatabase {
     this.restoredPendingBaseRevision = null;
   }
 
-  public async pushStateToCloud(): Promise<boolean> {
+  public async pushStateToCloud(onlyKeys?: string[]): Promise<boolean> {
     if (!this.cloudSyncEnabled) return false;
-    return (await this.runSyncCycle('push')) === true;
+    return (await this.runSyncCycle('push', false, false, onlyKeys)) === true;
   }
 
-  private async pushStateToCloudInternal(forceAll: boolean, allowConflictRetry = true, explicitRetry = false): Promise<boolean> {
+  private async pushStateToCloudInternal(forceAll: boolean, allowConflictRetry = true, explicitRetry = false, onlyKeys?: string[]): Promise<boolean> {
     const requestGeneration = this.syncGeneration;
     let timeoutId: ReturnType<typeof setTimeout> | null = null;
     let controller: AbortController | null = null;
@@ -1275,7 +1330,7 @@ export class AppDatabase {
         }
       }
 
-      const keysToSend = Array.from(this.dirtyKeys);
+      const keysToSend = onlyKeys ? onlyKeys.filter(key => this.dirtyKeys.has(key)) : Array.from(this.dirtyKeys);
       if (keysToSend.length === 0) {
         this.emitCloudStatus('synced', 'تغییری برای ارسال وجود ندارد.', { lastSyncedAt: new Date().toISOString() });
         return true;
@@ -1293,7 +1348,10 @@ export class AppDatabase {
         }
       }
 
-      const fingerprint = cloudWriteFingerprint(this.cloudRevision, sentRaw.entries());
+      const sourceImportContext = this.pendingSourceImportContext;
+      const fingerprintEntries: Array<[string, string | null]> = Array.from(sentRaw.entries());
+      if (sourceImportContext) fingerprintEntries.push(['sourceImport', JSON.stringify(sourceImportContext)]);
+      const fingerprint = cloudWriteFingerprint(this.cloudRevision, fingerprintEntries);
       if (this.terminalRejectedSnapshot && isSameRejectedSnapshot(this.terminalRejectedSnapshot.fingerprint, fingerprint) && !explicitRetry) {
         const status = this.terminalRejectedSnapshot.status === 401 ? 'authentication_required' : 'write_rejected';
         const message = this.terminalRejectedSnapshot.status === 403
@@ -1319,6 +1377,7 @@ export class AppDatabase {
           state: changes,
           baseRevision: this.cloudRevision,
           clientId: this.getClientId(),
+          ...(sourceImportContext ? { sourceImport: sourceImportContext } : {}),
         })
       });
       if (!isCurrentSyncGeneration(requestGeneration, this.syncGeneration)) return false;
@@ -1365,6 +1424,7 @@ export class AppDatabase {
       }
       this.cloudRevision = Number.isInteger(result.revision) ? Number(result.revision) : this.cloudRevision + 1;
       this.terminalRejectedSnapshot = null;
+      if (sourceImportContext && this.pendingSourceImportContext?.operationId === sourceImportContext.operationId) this.pendingSourceImportContext = null;
       if (result.state && typeof result.state === 'object') this.applyRemoteState(result.state);
       this.emitCloudStatus('synced', 'همه تغییرات در پایگاه داده ابری ذخیره شد.', {
         lastSyncedAt: result.updatedAt || new Date().toISOString()

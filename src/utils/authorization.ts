@@ -8,19 +8,20 @@ export type AuthorizationModule = typeof AUTHORIZATION_MODULES[number];
 export const AUTHORIZATION_CAPABILITIES = [
   'view', 'create', 'edit', 'delete', 'bulk_edit', 'bulk_delete', 'import', 'export',
   'submit', 'return', 'approve', 'reassign', 'delegate', 'advance_workflow', 'finalize',
-  'route_hse',
+  'route_hse', 'bulk_score', 'employee_import', 'criteria_import', 'mis_import', 'kasra_import',
 ] as const;
 export type AuthorizationCapability = typeof AUTHORIZATION_CAPABILITIES[number];
+export type ImportType = 'employee' | 'criteria' | 'mis' | 'kasra';
 /** Capabilities exposed for each source-supported product area. */
 export const MODULE_CAPABILITIES: Record<AuthorizationModule, readonly AuthorizationCapability[]> = {
-  employees: ['view', 'create', 'edit', 'delete', 'bulk_edit', 'bulk_delete', 'import', 'export'],
-  evaluations: ['view', 'create', 'edit', 'delete', 'bulk_edit', 'bulk_delete', 'import', 'export', 'submit', 'finalize'],
-  mis: ['view', 'import', 'export'],
+  employees: ['view', 'create', 'edit', 'delete', 'bulk_edit', 'bulk_delete', 'import', 'employee_import', 'export'],
+  evaluations: ['view', 'create', 'edit', 'delete', 'bulk_edit', 'bulk_delete', 'bulk_score', 'import', 'export', 'submit', 'finalize'],
+  mis: ['view', 'import', 'mis_import', 'kasra_import', 'export'],
   workflow: ['view', 'submit', 'return', 'approve', 'reassign', 'delegate', 'advance_workflow', 'finalize', 'route_hse'],
   cartable: ['view', 'submit', 'return', 'approve', 'reassign', 'delegate', 'advance_workflow', 'route_hse'],
   reports: ['view', 'export'],
   analytics: ['view', 'export'],
-  criteria: ['view', 'create', 'edit', 'delete', 'import', 'export'],
+  criteria: ['view', 'create', 'edit', 'delete', 'import', 'criteria_import', 'export'],
   profiles: ['view', 'create', 'edit', 'delete', 'import', 'export'],
   delegation: ['view', 'create', 'edit', 'delete', 'delegate'],
   calibration: ['view', 'edit', 'approve', 'advance_workflow'],
@@ -134,6 +135,24 @@ export function authorize(
   if (!subject) return { allowed: true, scope: permission, reason: 'capability granted' };
   if (!employeeWithinScope(actor, subject, permission)) return { allowed: false, scope: permission, reason: 'outside authorized employee scope' };
   return { allowed: true, scope: permission, reason: 'capability and scope granted' };
+}
+
+const IMPORT_AUTHORIZATION: Record<ImportType, { module: AuthorizationModule; capability: AuthorizationCapability }> = {
+  employee: { module: 'employees', capability: 'employee_import' },
+  criteria: { module: 'criteria', capability: 'criteria_import' },
+  mis: { module: 'mis', capability: 'mis_import' },
+  kasra: { module: 'mis', capability: 'kasra_import' },
+};
+
+/** Import rights are independent capabilities; generic edit/import grants never imply source import rights. */
+export function canImport(
+  actor: Employee,
+  importType: ImportType,
+  subject?: Employee,
+  policy: GranularPermissionPolicy = readGranularPermissionPolicy(),
+): { allowed: boolean; scope?: PermissionScope; reason: string } {
+  const target = IMPORT_AUTHORIZATION[importType];
+  return authorize(actor, target.module, target.capability, subject, policy);
 }
 
 export function getWorkflowCeiling(actor: Employee, policy: GranularPermissionPolicy = readGranularPermissionPolicy()): WorkflowStageKey {

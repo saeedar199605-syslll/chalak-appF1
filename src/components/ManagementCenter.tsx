@@ -77,6 +77,7 @@ import { db, mergeBackupCollections, validateBackupJSON } from '../utils/db';
 import { generateSecurePassword } from '../utils/password';
 import { planEmployeeBulkDeletion } from '../utils/employeeDeletion';
 import { resolveInitialEvaluationWorkflow } from '../utils/evaluationStart';
+import { matchesEmployeeSearch, rankEmployeesBySearch } from '../utils/personnelSearch';
 import { Table as UiTable } from './ui/Primitives';
 import { 
   ManualAccessPolicy, 
@@ -338,6 +339,15 @@ export default function ManagementCenter({
   const [selectedIndividualId, setSelectedIndividualId] = useState<string>(() => {
     return employees[0]?.id || '';
   });
+  const [individualSearchTerm, setIndividualSearchTerm] = useState('');
+  const individualSearchResults = useMemo(() => {
+    const filtered = rankEmployeesBySearch(employees, individualSearchTerm, employee => [employee.role, employee.unit]);
+    if (selectedIndividualId && !filtered.some(employee => employee.id === selectedIndividualId)) {
+      const selected = employees.find(employee => employee.id === selectedIndividualId);
+      return selected ? [selected, ...filtered] : filtered;
+    }
+    return filtered;
+  }, [employees, individualSearchTerm, selectedIndividualId]);
 
   const selectedIndividual = employees.find(e => e.id === selectedIndividualId) || employees[0];
 
@@ -736,13 +746,7 @@ export default function ManagementCenter({
 
   // Filtered Employees List for Credentials Table
   const filteredEmployees = useMemo(() => {
-    return employees.filter(emp => {
-      const q = userSearchTerm.toLowerCase();
-      const matchSearch = emp.name.toLowerCase().includes(q) || 
-                          emp.code.toLowerCase().includes(q) || 
-                          emp.username.toLowerCase().includes(q) || 
-                          emp.unit.toLowerCase().includes(q);
-      if (!matchSearch) return false;
+    return rankEmployeesBySearch(employees, userSearchTerm, employee => [employee.role, employee.unit]).filter(emp => {
 
       if (userRoleFilter !== 'all' && emp.role !== userRoleFilter) return false;
 
@@ -2082,6 +2086,7 @@ export default function ManagementCenter({
               </div>
 
               <div className="sm:col-span-3">
+                <input aria-label="جستجوی کاربر بر اساس کد پرسنلی" value={individualSearchTerm} onChange={event => setIndividualSearchTerm(event.target.value)} placeholder="جستجو با نام یا کد پرسنلی" className="w-full rounded-xl border border-slate-700 bg-slate-950 px-2.5 py-2 text-xs text-slate-200" />
                 <select
                   value={userRoleFilter}
                   onChange={(e) => setUserRoleFilter(e.target.value as any)}
@@ -2519,7 +2524,7 @@ export default function ManagementCenter({
                   onChange={(e) => setSelectedIndividualId(e.target.value)}
                   className="w-full text-xs p-2.5 rounded-xl border bg-slate-950 border-slate-700 text-slate-100 font-bold focus:outline-none focus:ring-1 focus:ring-teal-500 cursor-pointer"
                 >
-                  {employees.map(emp => (
+                  {individualSearchResults.map(emp => (
                     <option key={emp.id} value={emp.id}>
                       {emp.name} — {emp.code} ({emp.unit})
                     </option>

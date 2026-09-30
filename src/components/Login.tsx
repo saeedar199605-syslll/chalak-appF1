@@ -37,6 +37,7 @@ export default function Login({ employees, onLogin, theme }: LoginProps) {
   const [showUserPass, setShowUserPass] = useState(false);
   const [errorMsg, setErrorMsg] = useState('');
   const [isSubmitting, setIsSubmitting] = useState(false);
+  const isSubmittingRef = useRef(false);
 
   const loginLifecycle = useRef(0);
   const clearPasswordInputs = () => {
@@ -136,7 +137,7 @@ export default function Login({ employees, onLogin, theme }: LoginProps) {
 
   const handleFormSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
-    if (isSubmitting) return;
+    if (isSubmitting || isSubmittingRef.current) return;
     clearPasswordInputs();
     const lifecycle = loginLifecycle.current;
     setErrorMsg('');
@@ -149,6 +150,7 @@ export default function Login({ employees, onLogin, theme }: LoginProps) {
     const submittedUsername = activeTab === 'users' ? username : adminUsername;
     const submittedPassword = activeTab === 'users' ? password : adminPassword;
     if (submittedUsername.trim() && submittedPassword.trim()) {
+      isSubmittingRef.current = true;
       setIsSubmitting(true);
       try {
         const response = await fetch('/api/auth/login', {
@@ -217,6 +219,7 @@ export default function Login({ employees, onLogin, theme }: LoginProps) {
         }
         // Vite-only development has no Pages Functions; continue with local demo authentication.
       } finally {
+        isSubmittingRef.current = false;
         setIsSubmitting(false);
       }
     }

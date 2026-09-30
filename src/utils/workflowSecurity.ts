@@ -1,6 +1,6 @@
-import type { Criterion, Employee, Evaluation, ScoreSourceBreakdown, WorkflowStageKey, WorkflowTransitionLog } from '../types';
+import type { Criterion, Employee, Evaluation, JobProfile, ScoreSourceBreakdown, WorkflowStageKey, WorkflowTransitionLog } from '../types';
 import { NEED_DOCUMENT_SCORES } from '../types';
-import { authorize, canAccessWorkflowStage, isWithinWorkflowCeiling, type GranularPermissionPolicy } from './authorization';
+import { authorize, canAccessWorkflowStage, canImport, isWithinWorkflowCeiling, type GranularPermissionPolicy } from './authorization';
 import { canPerformWorkflowAction, isExplicitlyReassigned, isWithinSupervisorScope, type DelegationRecord } from './workflowAuthorization';
 import { calculateMultiSourceCompositeScore } from './formulaEngine';
 import { resolveWorkflowAssignee } from './workflowAssignee';
@@ -8,12 +8,15 @@ import { isManualScoreInRange } from './criterionScoring';
 import { DEFAULT_ROUTE_RULES } from '../types';
 import type { EvaluationRouteRule } from '../types';
 import { resolveInitialEvaluationWorkflow } from './evaluationStart';
+import { getEvaluationPeriodId } from './evaluationPeriod';
+import { isProtectedSourceImportContext, validImportedScoreChange, type ProtectedSourceImportContext } from './sourceImports';
 
 export type EvaluationWriteFailure =
   | 'identity_changed' | 'new_evaluation_requires_admin' | 'transition_missing_history'
   | 'history_rewritten' | 'invalid_transition' | 'permission_denied' | 'ceiling_exceeded'
   | 'completed_immutable' | 'mis_value_read_only' | 'score_stage_denied' | 'score_field_denied'
-  | 'owner_change_requires_reassignment' | 'missing_required_input' | 'score_limit_exceeded';
+  | 'owner_change_requires_reassignment' | 'missing_required_input' | 'score_limit_exceeded'
+  | 'kasra_import_not_authorized' | 'mis_import_not_authorized' | 'source_import_invalid';
 
 const stageNext: Partial<Record<WorkflowStageKey, WorkflowStageKey[]>> = {
   self_review: ['supervisor_review'],
@@ -112,7 +115,7 @@ function adminMISImportAllowed(
   );
 }
 
-function scoreWriteAllowed(existing: Evaluation, incoming: Evaluation, actor: Employee, criteria: Criterion[]): EvaluationWriteFailure | null {
+function scoreWriteAllowed(existing: Evaluation, incoming: Evaluation, actor: Employee, criteria: Criterion[], sourceImport?: ProtectedSourceImportContext): EvaluationWriteFailure | null {
   const oldByCid = new Map(existing.scores.map(score => [score.cid, score]));
   const newByCid = new Map(incoming.scores.map(score => [score.cid, score]));
   if (oldByCid.size !== newByCid.size || [...oldByCid.keys()].some(cid => !newByCid.has(cid))) return 'score_field_denied';
@@ -134,6 +137,11 @@ function scoreWriteAllowed(existing: Evaluation, incoming: Evaluation, actor: Em
         Number.isInteger(next.self) && next.self >= 0 && next.self <= 5 &&
         equalExcept(oldScore as unknown as Record<string, unknown>, next as unknown as Record<string, unknown>, ['self']);
       if (employeeSelfScoreAllowed) continue;
+      if (sourceImport) {
+        if (sourceImport.importType.toLowerCase() !== criterion?.scoringSource ||
+            !validImportedScoreChange(oldScore, next, criterion, sourceImport.importType)) return 'source_import_invalid';
+        continue;
+      }
       if (actor.role !== 'admin' || !adminMISImportAllowed(oldScore, next, criterion)) return 'mis_value_read_only';
       continue;
     }
@@ -165,9 +173,45 @@ export interface EvaluationWriteContext {
   actor: Employee;
   employees: Employee[];
   criteria?: Criterion[];
+  profiles?: JobProfile[];
   delegations: DelegationRecord[];
   permissionPolicy: GranularPermissionPolicy;
   routeRules?: EvaluationRouteRule[];
+  sourceImport?: ProtectedSourceImportContext;
+}
+
+function validateSourceImportEvaluation(existing: Evaluation, incoming: Evaluation, context: EvaluationWriteContext): EvaluationWriteFailure | null {
+  const sourceImport = context.sourceImport;
+  if (!sourceImport) return null;
+  const importType = sourceImport.importType.toLowerCase() as 'mis' | 'kasra';
+  const employee = context.employees.find(item => item.id === existing.empId);
+  if (!employee || !canImport(context.actor, importType, employee, context.permissionPolicy).allowed) {
+    return sourceImport.importType === 'KASRA' ? 'kasra_import_not_authorized' : 'mis_import_not_authorized';
+  }
+  if (getEvaluationPeriodId(existing) !== sourceImport.evaluationPeriodId ||
+      getEvaluationPeriodId(incoming) !== sourceImport.evaluationPeriodId ||
+      existing.status === 'locked' || existing.stage === 'completed' ||
+      !equalExcept(existing as unknown as Record<string, unknown>, incoming as unknown as Record<string, unknown>, ['scores']) ||
+      JSON.stringify(existing.scores) === JSON.stringify(incoming.scores)) return 'source_import_invalid';
+
+  const profile = context.profiles?.find(item => item.id === existing.profileId);
+  if (!profile) return 'source_import_invalid';
+  const criteriaById = new Map<string, Criterion>();
+  (context.criteria || []).forEach(item => { criteriaById.set(item.id, item); criteriaById.set(item.code, item); });
+  const profileCriterionIds = new Set(profile.items.flatMap(item => {
+    const criterion = criteriaById.get(item.cid);
+    return criterion ? [item.cid, criterion.id, criterion.code] : [item.cid];
+  }));
+  const previousScores = new Map(existing.scores.map(item => [item.cid, item]));
+  const nextScores = new Map(incoming.scores.map(item => [item.cid, item]));
+  for (const [cid, previous] of previousScores) {
+    const next = nextScores.get(cid);
+    if (!next) return 'source_import_invalid';
+    if (JSON.stringify(previous) === JSON.stringify(next)) continue;
+    if (!profileCriterionIds.has(cid) || !validImportedScoreChange(previous, next, criteriaById.get(cid), sourceImport.importType)) return 'source_import_invalid';
+  }
+  if (nextScores.size !== previousScores.size) return 'source_import_invalid';
+  return null;
 }
 
 /** Keep only workflow-owned payload fields when building a transition from the stored record. */
@@ -219,6 +263,12 @@ export function validateEvaluationWrite(existing: Evaluation | undefined, incomi
   if (JSON.stringify(existing) === JSON.stringify(incoming)) return null;
   const completedAppealSubmission = isValidCompletedAppealSubmission(existing, incoming, actor);
   if ((existing.stage === 'completed' || existing.status === 'locked') && JSON.stringify(existing) !== JSON.stringify(incoming) && !completedAppealSubmission) return 'completed_immutable';
+
+  if (context.sourceImport) {
+    const importFailure = validateSourceImportEvaluation(existing, incoming, context);
+    if (importFailure) return importFailure;
+    return scoreWriteAllowed(existing, incoming, actor, context.criteria || [], context.sourceImport);
+  }
 
   const oldHistory = existing.history || [];
   const nextHistory = incoming.history || [];

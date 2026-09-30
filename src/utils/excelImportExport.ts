@@ -14,6 +14,7 @@ import {
   DynamicColumnMapping,
   DynamicExcelRowRecord
 } from '../types';
+import { normalizeDigits, normalizePersonnelCode } from './personnelSearch';
 
 /**
  * Calculates a 1-5 Performance Rating for Attendance & Punctuality from Kasra Data
@@ -590,74 +591,70 @@ export async function parseKasraExcelFile(
       return { records: [], errors: ['فایل اکسل خالی است یا ساختار مناسبی ندارد.'], matchedCount: 0 };
     }
 
-    const headers: string[] = (rows[0] || []).map((h: any) => String(h || '').trim());
+    const headers: string[] = (rows[0] || []).map((h: any) => normalizeDigits(String(h || '').trim()));
     const dataRows = rows.slice(1);
 
-        const findCol = (keywords: string[]) =>
-          headers.findIndex(h => keywords.some(k => h.toLowerCase().includes(k.toLowerCase())));
-
-        const codeIdx = findCol(['کد پرسنلی', 'code', 'staff', 'شناسه', 'کد']);
-        const nameIdx = findCol(['نام', 'name', 'نام و خانوادگی', 'پرسنل']);
-        const periodIdx = findCol(['دوره', 'period', 'نیمسال', 'فصل']);
-        const hoursIdx = findCol(['ساعات کارکرد', 'کارکرد', 'ساعت', 'hours']);
-        const delayIdx = findCol(['تاخیر', 'تعجیل', 'delay', 'کسری']);
-        const absenceIdx = findCol(['غیبت', 'absence', 'غیرموجه']);
-        const leaveIdx = findCol(['مرخصی', 'leave']);
-        const overtimeIdx = findCol(['اضافه', 'اضافه‌کار', 'overtime']);
-        const infractionIdx = findCol(['تذکر', 'انضباطی', 'infraction', 'جریمه']);
-        const noteIdx = findCol(['توضیح', 'توضیحات', 'note', 'ملاحظات']);
-
-        const records: KasraAttendanceRecord[] = [];
-        const errors: string[] = [];
-        let matchedCount = 0;
-
-        dataRows.forEach((row, rIdx) => {
-          if (!row || row.length === 0 || !row[codeIdx !== -1 ? codeIdx : 0]) return;
-
-          const rawCode = String(row[codeIdx !== -1 ? codeIdx : 0] || '').trim();
-          const cleanCode = rawCode.toUpperCase();
-          const rawName = nameIdx !== -1 ? String(row[nameIdx] || '').trim() : '';
-          const period = periodIdx !== -1 ? String(row[periodIdx] || 'نیمه اول ۱۴۰۵').trim() : 'نیمه اول ۱۴۰۵';
-
-          const totalWorkHours = Number(row[hoursIdx]) || 960;
-          const delayMinutes = Number(row[delayIdx]) || 0;
-          const absenceDays = Number(row[absenceIdx]) || 0;
-          const leaveDays = Number(row[leaveIdx]) || 0;
-          const overtimeHours = Number(row[overtimeIdx]) || 0;
-          const disciplineInfractions = Number(row[infractionIdx]) || 0;
-          const notes = noteIdx !== -1 ? String(row[noteIdx] || '') : '';
-
-          const matchedEmp = existingEmployees.find(
-            emp => emp.code.toUpperCase() === cleanCode || 
-                   emp.username.toLowerCase() === rawCode.toLowerCase() ||
-                   (rawName && emp.name.includes(rawName))
-          );
-
-          if (matchedEmp) {
-            matchedCount++;
-          } else {
-            errors.push(`ردیف ${rIdx + 2}: کد پرسنلی «${rawCode}» در سامانه کارکنان ثبت نشده است.`);
-          }
-
-          const calculatedScore = calculateKasraScore(delayMinutes, absenceDays, disciplineInfractions);
-
-          records.push({
-            id: 'kasra-' + Date.now() + '-' + rIdx,
-            empCode: matchedEmp ? matchedEmp.code : cleanCode,
-            empName: matchedEmp ? matchedEmp.name : rawName,
-            period,
-            totalWorkHours,
-            delayMinutes,
-            absenceDays,
-            leaveDays,
-            overtimeHours,
-            disciplineInfractions,
-            calculatedScore,
-            notes,
-            importedAt: new Date().toLocaleDateString('fa-IR')
-          });
-        });
-
+    const findCol = (keywords: string[]) => headers.findIndex(header => keywords.some(keyword => header.toLocaleLowerCase().includes(keyword.toLocaleLowerCase())));
+    const codeIdx = findCol(['کد پرسنلی', 'personnel code', 'staff code', 'code', 'کد']);
+    const nameIdx = findCol(['نام و نام خانوادگی', 'نام', 'name']);
+    const periodIdx = findCol(['دوره ارزیابی', 'دوره', 'period']);
+    const periodIdIdx = findCol(['شناسه دوره', 'period id', 'evaluationperiodid']);
+    const hoursIdx = findCol(['ساعات کارکرد', 'کارکرد', 'ساعت', 'hours']);
+    const delayIdx = findCol(['تاخیر', 'تأخیر', 'delay']);
+    const absenceIdx = findCol(['غیبت', 'absence']);
+    const leaveIdx = findCol(['مرخصی', 'leave']);
+    const overtimeIdx = findCol(['اضافه‌کار', 'اضافه کار', 'overtime']);
+    const infractionIdx = findCol(['تذکر انضباطی', 'انضباطی', 'infraction', 'جریمه']);
+    const noteIdx = findCol(['توضیح', 'توضیحات', 'note', 'ملاحظات']);
+    const errors: string[] = [];
+    if (codeIdx < 0) errors.push('ستون کد پرسنلی در فایل پیدا نشد.');
+    if (delayIdx < 0 || absenceIdx < 0 || infractionIdx < 0) errors.push('ستون‌های تاخیر، غیبت و تذکر انضباطی باید در فایل وجود داشته باشند.');
+    const parseNumber = (row: any[], index: number): number => {
+      if (index < 0 || row[index] === undefined || row[index] === null || String(row[index]).trim() === '') return Number.NaN;
+      const raw = normalizeDigits(String(row[index]).replace(/[٬,]/g, '').trim()).replace('٫', '.');
+      const value = Number(raw);
+      return Number.isFinite(value) ? value : Number.NaN;
+    };
+    const employeeCodeCounts = new Map<string, number>();
+    existingEmployees.forEach(employee => {
+      const code = normalizePersonnelCode(employee.code);
+      if (code) employeeCodeCounts.set(code, (employeeCodeCounts.get(code) || 0) + 1);
+    });
+    const records: KasraAttendanceRecord[] = [];
+    let matchedCount = 0;
+    dataRows.forEach((row, rIdx) => {
+      if (!row || row.every((cell: unknown) => String(cell ?? '').trim() === '')) return;
+      const rawCode = String(row[codeIdx >= 0 ? codeIdx : 0] || '').trim();
+      const codeKey = normalizePersonnelCode(rawCode);
+      const rawName = nameIdx >= 0 ? String(row[nameIdx] || '').trim() : '';
+      const matchingEmployees = existingEmployees.filter(employee => normalizePersonnelCode(employee.code) === codeKey);
+      const matchedEmp = matchingEmployees.length === 1 && employeeCodeCounts.get(codeKey) === 1 ? matchingEmployees[0] : undefined;
+      if (matchedEmp) matchedCount++;
+      else if (rawCode) errors.push(matchingEmployees.length > 1 || (employeeCodeCounts.get(codeKey) || 0) > 1
+        ? `ردیف ${rIdx + 2}: کد پرسنلی «${rawCode}» در سامانه تکراری است.`
+        : `ردیف ${rIdx + 2}: کد پرسنلی «${rawCode}» در سامانه کارکنان ثبت نشده است.`);
+      const delayMinutes = parseNumber(row, delayIdx);
+      const absenceDays = parseNumber(row, absenceIdx);
+      const disciplineInfractions = parseNumber(row, infractionIdx);
+      const recordsForMetricsValid = [delayMinutes, absenceDays, disciplineInfractions].every(value => Number.isFinite(value) && value >= 0);
+      if (!recordsForMetricsValid) errors.push(`ردیف ${rIdx + 2}: مقدار تاخیر، غیبت یا تذکر انضباطی خالی یا نامعتبر است.`);
+      records.push({
+        id: `kasra-${Date.now()}-${rIdx}`,
+        empCode: matchedEmp?.code || rawCode,
+        empName: matchedEmp?.name || rawName,
+        period: periodIdx >= 0 ? String(row[periodIdx] || '').trim() : '',
+        evaluationPeriodId: periodIdIdx >= 0 ? String(row[periodIdIdx] || '').trim() || undefined : undefined,
+        totalWorkHours: parseNumber(row, hoursIdx),
+        delayMinutes,
+        absenceDays,
+        leaveDays: leaveIdx >= 0 ? parseNumber(row, leaveIdx) : 0,
+        overtimeHours: overtimeIdx >= 0 ? parseNumber(row, overtimeIdx) : 0,
+        disciplineInfractions,
+        calculatedScore: recordsForMetricsValid ? calculateKasraScore(delayMinutes, absenceDays, disciplineInfractions) : Number.NaN,
+        notes: noteIdx >= 0 ? String(row[noteIdx] || '') : '',
+        importedAt: new Date().toISOString(),
+      });
+    });
     return { records, errors, matchedCount };
     } catch (err: any) {
         return { records: [], errors: ['خطا در خواندن فایل اکسل کسری: ' + err.message], matchedCount: 0 };
@@ -819,7 +816,11 @@ export async function parseMISExcelFile(
     }
     if (missing) return makeResult([], 0);
 
-    const employeesByCode = new Map(existingEmployees.map(item => [normalize(item.code).toUpperCase(), item]));
+    const employeesByCode = new Map<string, Employee[]>();
+    existingEmployees.forEach(item => {
+      const key = normalizePersonnelCode(item.code);
+      if (key) employeesByCode.set(key, [...(employeesByCode.get(key) || []), item]);
+    });
     const seen = new Set<string>();
     const records: MISProductionRecord[] = [];
     const parseNumber = (value: unknown) => {
@@ -834,8 +835,9 @@ export async function parseMISExcelFile(
       const val = (field: keyof typeof col) => String(row?.[col[field]] ?? '').trim();
       if (!row?.some(cell => String(cell ?? '').trim())) return;
       const rawCode = val('code');
-      const code = normalize(rawCode).toUpperCase();
-      const employee = employeesByCode.get(code);
+      const code = normalizePersonnelCode(rawCode);
+      const employeeMatches = employeesByCode.get(code) || [];
+      const employee = employeeMatches.length === 1 ? employeeMatches[0] : undefined;
       let invalid = false;
       const issue = (field: keyof typeof col | 'code', message: string, correction: string) => {
         const idx = field === 'code' ? col.code : col[field];
@@ -845,7 +847,8 @@ export async function parseMISExcelFile(
       if (!code) issue('code', 'کد پرسنلی خالی است', 'کد یکتای ثبت‌شده در فهرست کارکنان را وارد کنید.');
       if (code && seen.has(code)) issue('code', 'کد پرسنلی در فایل تکراری است', 'برای هر کد در یک دوره فقط یک ردیف نگه دارید.');
       if (code) seen.add(code);
-      if (code && !employee) issue('code', 'کارمند با این کد شناخته نمی‌شود', 'کد را بررسی یا ابتدا کارمند را وارد کنید.');
+      if (code && employeeMatches.length > 1) issue('code', 'کد پرسنلی در سامانه تکراری است', 'کد پرسنلی را برای هر کارمند یکتا کنید.');
+      else if (code && !employee) issue('code', 'کارمند با این کد شناخته نمی‌شود', 'کد را بررسی یا ابتدا کارمند را وارد کنید.');
       const period = col.period >= 0 ? val('period') : expectedPeriod?.trim() || '';
       if (!period) issue('period', 'دوره ارزیابی خالی است', 'دوره ارزیابی را وارد کنید.');
       if (expectedPeriod?.trim() && normalize(period) !== normalize(expectedPeriod)) issue('period', 'دوره با زمینه انتخاب‌شده یکسان نیست', `ردیف را به دوره ${expectedPeriod} اصلاح کنید.`);

@@ -231,6 +231,7 @@ export interface KasraAttendanceRecord {
   empCode: string;
   empName?: string;
   period: string;
+  evaluationPeriodId?: string;
   totalWorkHours: number;
   delayMinutes: number;
   absenceDays: number;
@@ -310,6 +311,8 @@ export interface Evaluation {
   empId: string;
   profileId: string;
   period: string; // e.g., "نیمه اول ۱۴۰۵"
+  /** Stable period identity; optional for backward compatibility with legacy evaluations. */
+  evaluationPeriodId?: string;
   status: 'draft' | 'calibrated' | 'locked';
   stage?: WorkflowStageKey; // Current workflow stage
   currentAssigneeId?: string; // Who currently has the task (e.g. employee, supervisor, HR/admin)

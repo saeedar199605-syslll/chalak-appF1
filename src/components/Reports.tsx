@@ -29,6 +29,7 @@ import RadarChartD3, { CompetencyDimensionData } from './RadarChartD3';
 import NineBoxAIAnalysis from './NineBoxAIAnalysis';
 import { downloadWorkflowCalendarICS, DEFAULT_WORKFLOW_DEADLINES } from '../utils/calendarExport';
 import { db } from '../utils/db';
+import { rankEmployeesBySearch } from '../utils/personnelSearch';
 
 const GRADE_PILL_TEXT: Record<string, string> = {
   emerald: 'text-emerald-700 dark:text-emerald-300',
@@ -157,6 +158,8 @@ export default function Reports({
   }).filter(c => c.count > 0);
 
   const [selectedEmpForRadar, setSelectedEmpForRadar] = useState<string>('all');
+  const [radarEmployeeQuery, setRadarEmployeeQuery] = useState('');
+  const radarEmployeeResults = rankEmployeesBySearch(employees, radarEmployeeQuery);
 
   const getRadarData = (): CompetencyDimensionData[] => {
     const targetEvals = selectedEmpForRadar === 'all'
@@ -437,14 +440,15 @@ export default function Reports({
 
           <div className="flex items-center gap-2">
             <span className="text-xs text-slate-600 dark:text-slate-400">فیلتر پرسنل:</span>
+            <input aria-label="جستجوی گزارش بر اساس کد پرسنلی" value={radarEmployeeQuery} onChange={event => setRadarEmployeeQuery(event.target.value)} placeholder="نام یا کد پرسنلی" className="w-36 rounded-xl border border-slate-200 bg-white px-2 py-1.5 text-xs dark:border-slate-700 dark:bg-slate-950/70" />
             <select
               value={selectedEmpForRadar}
               onChange={(e) => setSelectedEmpForRadar(e.target.value)}
               className="text-xs font-bold bg-white dark:bg-slate-950/70 border border-slate-200 dark:border-slate-700 text-teal-800 dark:text-teal-300 px-3 py-1.5 rounded-xl focus:outline-none focus:ring-1 focus:ring-teal-500"
             >
               <option value="all">میانگین کل سازمان (اصفهان چالاک)</option>
-              {employees.map(emp => (
-                <option key={emp.id} value={emp.id}>{emp.name} ({emp.unit})</option>
+              {radarEmployeeResults.map(emp => (
+                <option key={emp.id} value={emp.id}>{emp.name} · {emp.code} ({emp.unit})</option>
               ))}
             </select>
           </div>

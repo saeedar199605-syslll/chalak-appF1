@@ -64,6 +64,7 @@ import { resolveWorkflowAssignee } from '../utils/workflowAssignee';
 import { buildBulkAdvanceUpdates, previewBulkAdvance, type BulkAdvanceReason, type BulkAdvanceRow } from '../utils/bulkWorkflow';
 import { workflowTransitionPayloadFields } from '../utils/workflowSecurity';
 import { db } from '../utils/db';
+import { employeeSearchScore, matchesEmployeeSearch, rankEmployeesBySearch } from '../utils/personnelSearch';
 import {
   Employee,
   Evaluation,
@@ -219,6 +220,7 @@ export default function WorkflowManager({
   const [actionComment, setActionComment] = useState('');
   const [overrideStage, setOverrideStage] = useState<WorkflowStageKey>('supervisor_review');
   const [reassignTargetId, setReassignTargetId] = useState<string>('');
+  const [personSelectorQuery, setPersonSelectorQuery] = useState('');
 
   // IDP modal
   const [idpModalEval, setIdpModalEval] = useState<Evaluation | null>(null);
@@ -539,23 +541,18 @@ export default function WorkflowManager({
 
   // Filter for "All Workflows"
   const allFilteredEvaluations = useMemo(() => {
-    return normalizedEvaluations.filter(ev => {
+    const filtered = normalizedEvaluations.filter(ev => {
       if (ev.period !== selectedPeriod) return false;
       if (stageFilter !== 'all' && ev.stage !== stageFilter) return false;
       if (!canViewEvaluation(currentUser, ev, employees, delegations || [])) return false;
       const emp = employeeById.get(ev.empId);
       if (!emp) return false;
       if (selectedUnit !== 'all' && emp.unit !== selectedUnit) return false;
-      if (searchQuery.trim()) {
-        const q = searchQuery.toLowerCase();
-        const matchesName = emp.name.toLowerCase().includes(q);
-        const matchesCode = emp.code.toLowerCase().includes(q);
-        const matchesUnit = emp.unit.toLowerCase().includes(q);
-        const matchesAssignee = (ev.currentAssigneeName || '').toLowerCase().includes(q);
-        if (!matchesName && !matchesCode && !matchesUnit && !matchesAssignee) return false;
-      }
+      if (!matchesEmployeeSearch(emp, searchQuery, [ev.currentAssigneeName || '', ev.period])) return false;
       return true;
     });
+    if (!searchQuery.trim()) return filtered;
+    return filtered.sort((left, right) => employeeSearchScore(employeeById.get(right.empId)!, searchQuery, [right.currentAssigneeName || '', right.period]) - employeeSearchScore(employeeById.get(left.empId)!, searchQuery, [left.currentAssigneeName || '', left.period]));
   }, [normalizedEvaluations, selectedPeriod, stageFilter, selectedUnit, searchQuery, employees, employeeById, currentUser, delegations]);
 
   const visibleTaskEvaluations = myTaskEvaluations.slice(taskPage * TASK_PAGE_SIZE, (taskPage + 1) * TASK_PAGE_SIZE);
@@ -2853,14 +2850,15 @@ export default function WorkflowManager({
             {actionType === 'reassign' && (
               <div>
                 <label className="block text-xs font-semibold text-slate-400 mb-1.5">شخص جدید مسئول کارتابل:</label>
+                <input aria-label="جستجوی مسئول جدید با کد پرسنلی" value={personSelectorQuery} onChange={event => setPersonSelectorQuery(event.target.value)} placeholder="جستجو با نام یا کد پرسنلی" className="mb-2 w-full rounded-xl border border-slate-800 bg-slate-950 p-2.5 text-xs text-slate-200" />
                 <select
                   value={reassignTargetId}
                   onChange={e => setReassignTargetId(e.target.value)}
                   className="w-full bg-slate-950 border border-slate-800 rounded-xl p-2.5 text-xs text-slate-200 focus:outline-none"
                 >
                   <option value="">-- انتخاب همکار / سرپرست / مدیر --</option>
-                  {employees.map(e => (
-                    <option key={e.id} value={e.id}>{e.name} ({e.unit} - {e.role === 'admin' ? 'مدیر' : e.role === 'supervisor' ? 'سرپرست' : 'کارمند'})</option>
+                  {rankEmployeesBySearch(employees, personSelectorQuery, employee => [employee.unit, employee.role]).map(e => (
+                    <option key={e.id} value={e.id}>{e.name} · {e.code} ({e.unit} - {e.role === 'admin' ? 'مدیر' : e.role === 'supervisor' ? 'سرپرست' : 'کارمند'})</option>
                   ))}
                 </select>
               </div>
@@ -3366,6 +3364,7 @@ export default function WorkflowManager({
             <div className="space-y-3 text-right">
               <div>
                 <label className="block text-xs font-semibold text-slate-400 mb-1.5" htmlFor="delegation-target">کارمند واگذار‌شده‌به:</label>
+                <input aria-label="جستجوی دریافت‌کننده تفویض با کد پرسنلی" value={personSelectorQuery} onChange={event => setPersonSelectorQuery(event.target.value)} placeholder="جستجو با نام یا کد پرسنلی" className="mb-2 w-full rounded-xl border border-slate-800 bg-slate-950 p-2.5 text-xs text-slate-200" />
                 <select
                   id="delegation-target"
                   value={newDelegationTargetId}
@@ -3373,8 +3372,8 @@ export default function WorkflowManager({
                   className="w-full bg-slate-950 border border-slate-800 rounded-xl p-2.5 text-xs text-slate-200 focus:outline-none focus:border-teal-500"
                 >
                   <option value="">انتخاب کارمند...</option>
-                  {employees.filter(e => e.id !== currentUser.id && e.role !== 'admin').map(emp => (
-                    <option key={emp.id} value={emp.id}>{emp.name} — {emp.unit}</option>
+                  {rankEmployeesBySearch(employees.filter(e => e.id !== currentUser.id && e.role !== 'admin'), personSelectorQuery, employee => [employee.unit]).map(emp => (
+                    <option key={emp.id} value={emp.id}>{emp.name} — {emp.code} — {emp.unit}</option>
                   ))}
                 </select>
               </div>
@@ -3418,9 +3417,10 @@ export default function WorkflowManager({
               {newDelegationScope === 'employee' && (
                 <div>
                   <label className="block text-xs font-semibold text-slate-400 mb-1.5" htmlFor="delegation-scope-employee">پرونده کارمند:</label>
+                  <input aria-label="جستجوی پرونده تفویض با کد پرسنلی" value={personSelectorQuery} onChange={event => setPersonSelectorQuery(event.target.value)} placeholder="جستجو با نام یا کد پرسنلی" className="mb-2 w-full rounded-xl border border-slate-800 bg-slate-950 p-2.5 text-xs text-slate-200" />
                   <select id="delegation-scope-employee" value={newDelegationEmployeeId} onChange={e => setNewDelegationEmployeeId(e.target.value)} className="w-full bg-slate-950 border border-slate-800 rounded-xl p-2.5 text-xs text-slate-200">
                     <option value="">انتخاب کارمند...</option>
-                    {employees.filter(e => currentUser.role === 'admin' || e.supervisorId === currentUser.id || e.id === currentUser.id || (!e.supervisorId && e.unit === currentUser.unit)).map(e => <option key={e.id} value={e.id}>{e.name}</option>)}
+                    {rankEmployeesBySearch(employees.filter(e => currentUser.role === 'admin' || e.supervisorId === currentUser.id || e.id === currentUser.id || (!e.supervisorId && e.unit === currentUser.unit)), personSelectorQuery).map(e => <option key={e.id} value={e.id}>{e.name} · {e.code}</option>)}
                   </select>
                 </div>
               )}

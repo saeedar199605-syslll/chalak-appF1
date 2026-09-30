@@ -50,7 +50,7 @@ interface MultiSourceCriteriaImportModalProps {
     mergedCriteria: Array<Omit<Criterion, 'id'> & { id?: string }>,
     strategy: MergeStrategy,
     stats: { total: number; added: number; updated: number; departments: string[] }
-  ) => void;
+  ) => boolean | Promise<boolean>;
   theme?: 'dark' | 'light';
 }
 
@@ -76,6 +76,7 @@ export default function MultiSourceCriteriaImportModal({
   const [selectedDeptInput, setSelectedDeptInput] = useState<string>(DEPARTMENT_PRESETS[0]);
   const [customDeptInput, setCustomDeptInput] = useState<string>('');
   const [mergeStrategy, setMergeStrategy] = useState<MergeStrategy>('merge');
+  const [isCommitting, setIsCommitting] = useState(false);
   
   // Preview filters and selection
   const [previewFilterDept, setPreviewFilterDept] = useState<string>('ALL');
@@ -629,7 +630,8 @@ export default function MultiSourceCriteriaImportModal({
   };
 
   // Final Commit
-  const handleExecuteCommit = () => {
+  const handleExecuteCommit = async () => {
+    if (isCommitting) return;
     const itemsToCommit = combinedRawCriteria.filter(it => selectedItemKeys.has(it.mergeKey));
     if (itemsToCommit.length === 0) {
       alert('هیچ شاخصی جهت ثبت انتخاب نشده است.');
@@ -668,14 +670,19 @@ export default function MultiSourceCriteriaImportModal({
       });
     });
 
-    onCommitMerge(deduplicated, mergeStrategy, {
-      total: deduplicated.length,
-      added: newCount,
-      updated: updateCount,
-      departments: departmentsInSources
-    });
-
-    onClose();
+    setIsCommitting(true);
+    try {
+      const accepted = await onCommitMerge(deduplicated, mergeStrategy, {
+        total: deduplicated.length,
+        added: newCount,
+        updated: updateCount,
+        departments: departmentsInSources
+      });
+      if (accepted) onClose();
+      else alert('ثبت درون‌ریزی پذیرفته نشد؛ دسترسی را بررسی کنید و دوباره تلاش کنید.');
+    } finally {
+      setIsCommitting(false);
+    }
   };
 
   return (
@@ -1202,7 +1209,7 @@ export default function MultiSourceCriteriaImportModal({
               <button
                 type="button"
                 onClick={handleExecuteCommit}
-                disabled={selectedItemKeys.size === 0}
+                disabled={selectedItemKeys.size === 0 || isCommitting}
                 className="px-6 py-2.5 bg-gradient-to-r from-emerald-600 to-teal-500 hover:from-emerald-500 hover:to-teal-400 disabled:opacity-40 text-slate-950 font-black rounded-xl text-xs flex items-center gap-2 shadow-xl shadow-emerald-500/20 cursor-pointer transition"
               >
                 <Check className="w-4 h-4" />

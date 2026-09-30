@@ -35,14 +35,19 @@ import { VirtualizedTable } from './VirtualizedTable';
 import { HighlightText } from './HighlightText';
 import UniversalDataExchange, { DataExchangeConfig } from './UniversalDataExchange';
 import { prepareEmployeeImport } from '../utils/employeeImport';
+import { employeeSearchScore, matchesEmployeeSearch, normalizePersonnelCode } from '../utils/personnelSearch';
+import { canImport } from '../utils/authorization';
+import type { MasterDataSourceImportContext } from '../utils/sourceImports';
 
 interface EmployeesProps {
   employees: Employee[];
   profiles: JobProfile[];
+  currentUser: Employee | null;
   evaluations?: Evaluation[];
   onAddEmployee: (emp: Omit<Employee, 'id'>) => void;
   onUpdateEmployee: (id: string, emp: Omit<Employee, 'id'>) => void;
   onBulkUpdateEmployees?: (employees: Employee[]) => void;
+  onImportEmployees?: (employees: Employee[], sourceImport: MasterDataSourceImportContext) => Promise<boolean>;
   onDeleteEmployee: (id: string) => boolean | Promise<boolean>;
   onBulkDeleteEmployees?: (ids: string[]) => boolean | Promise<boolean>;
   onStartEvaluation: (empId: string) => void;
@@ -85,14 +90,17 @@ export default function Employees({
   employees,
   evaluations = [],
   profiles,
+  currentUser,
   onAddEmployee,
   onUpdateEmployee,
   onBulkUpdateEmployees,
+  onImportEmployees,
   onDeleteEmployee,
   onBulkDeleteEmployees,
   onStartEvaluation,
   theme = 'light'
 }: EmployeesProps) {
+  const employeeImportAllowed = Boolean(currentUser && canImport(currentUser, 'employee').allowed);
   const [searchTerm, setSearchTerm] = useState('');
   const [viewMode, setViewMode] = useState<'table' | 'grid'>('table');
   const [isModalOpen, setIsModalOpen] = useState(false);
@@ -201,9 +209,9 @@ export default function Employees({
   };
 
   const selectByPersonnelCodes = () => {
-    const codes: string[] = selectionCodes.split(/[\s,،;؛]+/).map(code => code.trim().replace(/[۰-۹]/g, digit => String('۰۱۲۳۴۵۶۷۸۹'.indexOf(digit))).replace(/[٠-٩]/g, digit => String('٠١٢٣٤٥٦٧٨٩'.indexOf(digit))).toUpperCase()).filter(Boolean);
+    const codes: string[] = selectionCodes.split(/[\s,،;؛]+/).map(normalizePersonnelCode).filter(Boolean);
     if (!codes.length) { setSelectionFeedback(null); setBulkAssignError('کد پرسنلی وارد کنید.'); return; }
-    const byCode = new Map<string, Employee>(employees.filter(emp => !isProtectedAdmin(emp)).map(emp => [emp.code.toUpperCase(), emp]));
+    const byCode = new Map<string, Employee>(employees.filter(emp => !isProtectedAdmin(emp)).map(emp => [normalizePersonnelCode(emp.code), emp]));
     const uniqueCodes: string[] = [];
     const duplicates: string[] = [];
     const seen = new Set<string>();
@@ -295,6 +303,10 @@ export default function Employees({
   const [isBulkImporting, setIsBulkImporting] = useState(false);
 
   const beginEmployeeImportPreview = (items: any[]) => {
+    if (!employeeImportAllowed) {
+      setBulkStatusMsg({ text: 'مجوز درون‌ریزی اطلاعات پرسنلی برای این کاربر فعال نیست.', type: 'error' });
+      return;
+    }
     setIsBulkModalOpen(false);
     setBulkText('');
     setBulkStatusMsg(null);
@@ -316,16 +328,26 @@ export default function Employees({
   const [formHseReviewerId, setFormHseReviewerId] = useState('');
   const [errorMsg, setErrorMsg] = useState('');
 
-  const applyEmployeeImportPlan = (plan: ReturnType<typeof prepareEmployeeImport>) => {
+  const applyEmployeeImportPlan = async (plan: ReturnType<typeof prepareEmployeeImport>) => {
     const createdCount = plan.counts.NEW;
     const updatedCount = plan.counts.UPDATE;
     const totalSuccess = plan.changedCount;
     if (totalSuccess > 0) {
-      // This is the only employee-import persistence point, reached after explicit confirmation.
-      db.saveEmployees(plan.employees);
-      if (onBulkUpdateEmployees) {
+      const sourceImport: MasterDataSourceImportContext = {
+        importType: 'EMPLOYEE',
+        operationId: `employee:${crypto.randomUUID()}`,
+      };
+      if (onImportEmployees) {
+        const accepted = await onImportEmployees(plan.employees, sourceImport);
+        if (!accepted) return {
+          count: 0,
+          message: 'درون‌ریزی از سوی سرور پذیرفته نشد؛ داده‌های محلی بازگردانده شدند.',
+          errors: ['employee_import_not_authorized_or_invalid'],
+        };
+      } else if (onBulkUpdateEmployees) {
         onBulkUpdateEmployees(plan.employees);
       } else {
+        db.saveEmployees(plan.employees);
         plan.employees.forEach(emp => {
           const orig = employees.find(existing => existing.id === emp.id);
           if (orig) onUpdateEmployee(emp.id, emp);
@@ -346,6 +368,8 @@ export default function Employees({
     entityName: 'مدیریت پرسنل و پرونده‌های همکاران',
     entityKey: 'employees',
     items: employees,
+    canImport: employeeImportAllowed,
+    importUnavailableMessage: 'برای درون‌ریزی اطلاعات پرسنلی باید مجوز EMPLOYEE_IMPORT برای حساب شما فعال باشد.',
     csvHeaders: [
       { key: 'name', label: 'نام و نام خانوادگی' },
       { key: 'code', label: 'کد پرسنلی' },
@@ -406,7 +430,7 @@ export default function Employees({
         'کد پرسنلی تصویب‌کننده': ''
       }
     ],
-    onImport: (importedItems, mode) => applyEmployeeImportPlan(prepareEmployeeImport(importedItems, employees, profiles, mode)),
+    onImport: async (importedItems, mode) => applyEmployeeImportPlan(prepareEmployeeImport(importedItems, employees, profiles, mode)),
     prepareImport: (importedItems, mode) => {
       const plan = prepareEmployeeImport(importedItems, employees, profiles, mode);
       return {
@@ -669,7 +693,7 @@ export default function Employees({
   const filteredEmployees = useMemo(() => {
     const profilesById = new Map(profiles.map(profile => [profile.id, profile]));
     const statusByEmployeeId = new Map(evaluations.filter(item => item.period === CURRENT_ACTIVE_PERIOD).map(item => [item.empId, item.stage || item.status]));
-    return employees.filter(emp => {
+    const filtered = employees.filter(emp => {
       const profile = profilesById.get(emp.profileId);
       const evalStatus = String(statusByEmployeeId.get(emp.id) || 'not_started');
       
@@ -685,15 +709,10 @@ export default function Employees({
                        evalStatus === 'calibration_review' ? 'کالیبراسیون' :
                        evalStatus === 'finalized' ? 'نهایی شده' : evalStatus;
 
-      const term = searchTerm.toLowerCase();
-      
-      return emp.name.toLowerCase().includes(term) || 
-             emp.code.toLowerCase().includes(term) || 
-             emp.unit.toLowerCase().includes(term) ||
-             (profile?.title || '').toLowerCase().includes(term) ||
-             roleFa.includes(term) ||
-             statusFa.includes(term);
+      return matchesEmployeeSearch(emp, searchTerm, [profile?.title || '', roleFa, statusFa]);
     });
+    if (!searchTerm.trim()) return filtered;
+    return filtered.sort((left, right) => employeeSearchScore(right, searchTerm) - employeeSearchScore(left, searchTerm));
   }, [employees, profiles, searchTerm, evaluations]);
 
   const getRoleBadgeColor = (role: UserRole) => {

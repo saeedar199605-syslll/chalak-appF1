@@ -61,6 +61,11 @@ import {
   type MISImportIssue
 } from '../utils/excelImportExport';
 import { db, CURRENT_ACTIVE_PERIOD } from '../utils/db';
+import type { ProtectedSourceImportContext } from '../utils/sourceImports';
+import { canonicalEvaluationPeriodId, getEvaluationPeriodId } from '../utils/evaluationPeriod';
+import { canImport, readGranularPermissionPolicy } from '../utils/authorization';
+import { buildKasraPreviewRows, countKasraPreview, type KasraPreviewRow } from '../utils/kasraImport';
+import { matchesPersonnelCode, normalizePersonnelCode, normalizeSearchText } from '../utils/personnelSearch';
 
 interface ExcelIntegrationCenterProps {
   isOpen: boolean;
@@ -69,7 +74,7 @@ interface ExcelIntegrationCenterProps {
   profiles: JobProfile[];
   criteria: Criterion[];
   evaluations: Evaluation[];
-  onUpdateEvaluations: (evals: Evaluation[]) => void;
+  onUpdateEvaluations: (evals: Evaluation[], sourceImport?: ProtectedSourceImportContext) => boolean | Promise<boolean> | void;
   onAddEvaluation: (empId: string, period: string) => void;
   currentUser?: Employee | null;
 }
@@ -94,6 +99,10 @@ export default function ExcelIntegrationCenter({
   // Admin status
   const isAdmin = currentUser?.role === 'admin' || currentUser?.username === 'admin' || currentUser?.name?.includes('مدیریت');
   const [isManualEditEnabled, setIsManualEditEnabled] = useState(false);
+  const [selectedKasraPeriodId, setSelectedKasraPeriodId] = useState(() => canonicalEvaluationPeriodId(db.getMiscData<string>('pe_active_period', '')));
+  const [isKasraConfirmOpen, setIsKasraConfirmOpen] = useState(false);
+  const [isKasraApplying, setIsKasraApplying] = useState(false);
+  const [kasraApplySummary, setKasraApplySummary] = useState<{ rowsRead: number; employeesMatched: number; evaluationsUpdated: number; scoresUpdated: number; skipped: number; invalid: number; failed: number } | null>(null);
 
   // Dynamic Import State
   const [rawHeaders, setRawHeaders] = useState<string[]>([]);
@@ -124,6 +133,44 @@ export default function ExcelIntegrationCenter({
   const [misCounts, setMisCounts] = useState({ valid: 0, invalid: 0, duplicate: 0, unknown: 0, missingMapping: 0, warning: 0 });
   const [misExpectedPeriod, setMisExpectedPeriod] = useState(() => db.getMiscData<string>('pe_active_period', '').trim());
   const [isMisConfirmOpen, setIsMisConfirmOpen] = useState(false);
+  const activePeriodLabel = db.getMiscData<string>('pe_active_period', '').trim();
+  const periodOptions = useMemo(() => {
+    const byId = new Map<string, string>();
+    evaluations.forEach(evaluation => {
+      const id = getEvaluationPeriodId(evaluation);
+      if (id && !byId.has(id)) byId.set(id, evaluation.period);
+    });
+    if (activePeriodLabel) {
+      const id = canonicalEvaluationPeriodId(activePeriodLabel);
+      if (!byId.has(id)) byId.set(id, activePeriodLabel);
+    }
+    return Array.from(byId, ([id, label]) => ({ id, label }));
+  }, [evaluations, activePeriodLabel]);
+  const selectedKasraPeriod = periodOptions.find(period => period.id === selectedKasraPeriodId);
+  const kasraImportAllowed = Boolean(currentUser && canImport(currentUser, 'kasra', undefined, readGranularPermissionPolicy()).allowed);
+  const misImportAllowed = Boolean(currentUser && canImport(currentUser, 'mis', undefined, readGranularPermissionPolicy()).allowed);
+  const kasraPreviewRows: KasraPreviewRow[] = useMemo(() => buildKasraPreviewRows({
+    records: kasraRecords,
+    selectedPeriodId: selectedKasraPeriodId,
+    employees,
+    profiles,
+    criteria,
+    evaluations,
+    actor: currentUser,
+    policy: readGranularPermissionPolicy(),
+  }), [kasraRecords, selectedKasraPeriodId, employees, profiles, criteria, evaluations, currentUser]);
+  const kasraCounts = useMemo(() => countKasraPreview(kasraPreviewRows), [kasraPreviewRows]);
+  const filteredKasraPreviewRows = useMemo(() => {
+    const query = normalizeSearchText(searchTerm);
+    if (!query) return kasraPreviewRows;
+    return kasraPreviewRows.filter(row => matchesPersonnelCode(row.record.empCode, query) ||
+      normalizeSearchText(row.employee?.name || row.record.empName || '').includes(query));
+  }, [kasraPreviewRows, searchTerm]);
+  const filteredMisRecords = useMemo(() => {
+    const query = normalizeSearchText(searchTerm);
+    if (!query) return misRecords;
+    return misRecords.filter(record => matchesPersonnelCode(record.empCode, query) || normalizeSearchText(record.empName).includes(query));
+  }, [misRecords, searchTerm]);
 
   // Template Builder State
   const [builderPeriod, setBuilderPeriod] = useState('نیمه اول ۱۴۰۵');
@@ -144,6 +191,12 @@ export default function ExcelIntegrationCenter({
       setBuilderSelectedCriteria(criteria.map(c => c.id));
     }
   }, [criteria]);
+
+  useEffect(() => {
+    if (selectedKasraPeriodId && periodOptions.some(period => period.id === selectedKasraPeriodId)) return;
+    const activeId = canonicalEvaluationPeriodId(activePeriodLabel);
+    setSelectedKasraPeriodId(periodOptions.some(period => period.id === activeId) ? activeId : periodOptions[0]?.id || '');
+  }, [periodOptions, selectedKasraPeriodId, activePeriodLabel]);
 
   // Log audit helper
   const logAudit = (action: string, details: string, type: 'info' | 'warning' | 'success' | 'danger' = 'info') => {
@@ -480,197 +533,81 @@ export default function ExcelIntegrationCenter({
     );
   };
 
-  // --- 5. KASRA FILE UPLOAD (LEGACY DIRECT) ---
-  const handleKasraFileChange = async (e: React.ChangeEvent<HTMLInputElement>) => {
-    const file = e.target.files?.[0];
-    if (!file) return;
+  // --- 5. KASRA FILE UPLOAD ---
 
+  const handleKasraFileChange = async (event: React.ChangeEvent<HTMLInputElement>) => {
+    const file = event.target.files?.[0];
+    if (!file) return;
+    if (!kasraImportAllowed) {
+      setErrorMessage('برای درون‌ریزی کسری مجوز جداگانه ندارید.');
+      return;
+    }
+    if (!selectedKasraPeriodId) {
+      setErrorMessage('ابتدا دوره ارزیابی را انتخاب کنید.');
+      return;
+    }
     setIsProcessing(true);
     setErrorMessage('');
     setSuccessMessage('');
     setKasraErrors([]);
-
+    setKasraApplySummary(null);
     try {
       const result = await parseKasraExcelFile(file, employees);
       setKasraRecords(result.records);
       setKasraErrors(result.errors);
-      setSuccessMessage(`فایل کسری تحلیل شد: ${result.records.length} ردیف (${result.matchedCount} پرسنل منطبق).`);
-    } catch (err: any) {
-      setErrorMessage(err.message || 'خطا در پردازش فایل کسری');
+      setSuccessMessage(`فایل کسری خوانده شد: ${result.records.length} ردیف؛ دوره انتخاب‌شده: ${selectedKasraPeriod?.label || selectedKasraPeriodId}. هنوز تغییری ذخیره نشده است.`);
+    } catch (error) {
+      setErrorMessage(error instanceof Error ? error.message : 'خطا در پردازش فایل کسری');
     } finally {
       setIsProcessing(false);
       if (kasraFileInputRef.current) kasraFileInputRef.current.value = '';
     }
   };
 
-  const handleApplyKasraRecords = () => {
-    if (kasraRecords.length === 0) return;
-
-    let updatedEvaluations = [...evaluations];
-    let updatedEvalsCount = 0;
-    let newEvalsCount = 0;
-    let slotsPopulated = 0;
-    const warnings: string[] = [];
-
-    kasraRecords.forEach((rec, idx) => {
-      const rowNum = idx + 1;
-      const emp = employees.find(
-        e => (rec.empCode && e.code.toUpperCase() === rec.empCode.toUpperCase()) ||
-             (rec.empCode && e.username.toLowerCase() === rec.empCode.toLowerCase()) ||
-             (rec.empName && e.name.trim() === rec.empName.trim()) ||
-             (rec.empName && e.name.includes(rec.empName.trim()))
-      );
-
-      if (!emp) {
-        warnings.push(`ردیف ${rowNum}: پرسنل با کد «${rec.empCode || 'نامشخص'}» و نام «${rec.empName || 'نامشخص'}» یافت نشد.`);
+  const handleApplyKasraRecords = async () => {
+    if (isKasraApplying || !selectedKasraPeriodId) return;
+    const validRows = kasraPreviewRows.filter(row => row.status === 'valid' && row.updatedEvaluation);
+    if (!validRows.length) return;
+    const updates = new Map(validRows.map(row => [row.updatedEvaluation!.id, row.updatedEvaluation!]));
+    const updatedEvaluations = evaluations.map(evaluation => updates.get(evaluation.id) || evaluation);
+    const sourceImport: ProtectedSourceImportContext = {
+      importType: 'KASRA',
+      operationId: typeof crypto !== 'undefined' && 'randomUUID' in crypto ? crypto.randomUUID() : `kasra-${Date.now()}`,
+      evaluationPeriodId: selectedKasraPeriodId,
+    };
+    setIsKasraApplying(true);
+    setErrorMessage('');
+    try {
+      const accepted = await onUpdateEvaluations(updatedEvaluations, sourceImport);
+      if (accepted !== true) {
+        setErrorMessage('سرور ذخیره کسری را تأیید نکرد؛ تغییر در ارزیابی‌ها ثبت نشد. بررسی کنید مجوز و اتصال برقرار باشد.');
         return;
       }
-
-      let prof = profiles.find(p => p.id === emp.profileId);
-      if (!prof) {
-        prof = profiles[0];
-        if (prof) {
-          warnings.push(`ردیف ${rowNum} (${emp.name}): فاقد رده شغلی مشخص؛ الگوی «${prof.title}» اعمال شد.`);
-        }
-      }
-
-      if (!prof || !prof.items || prof.items.length === 0) {
-        warnings.push(`ردیف ${rowNum} (${emp.name}): هیچ شاخصی برای رده شغلی تعریف نشده است.`);
-        return;
-      }
-
-      const evalPeriod = rec.period || CURRENT_ACTIVE_PERIOD;
-      let targetIndex = updatedEvaluations.findIndex(
-        ev => ev.empId === emp.id && ev.period === evalPeriod
-      );
-
-      if (targetIndex === -1) {
-        const scores = prof.items.map(item => {
-          const crit = criteria.find(c => c.id === item.cid || c.code === item.cid);
-          const effectiveSource = crit?.scoringSource || (crit?.code.startsWith('B-01') ? 'kasra' : crit?.cat === 'K' ? 'mis' : 'supervisor');
-          const isKasraCrit = crit && effectiveSource === 'kasra' && (crit.autoPopulate !== false);
-          let scoreVal = 0;
-          let docVal = '';
-          let rawVal: number | undefined = undefined;
-
-          if (isKasraCrit) {
-            if (crit.misMetricKey === 'attendance_delay') {
-              scoreVal = rec.delayMinutes <= 15 ? 5 : rec.delayMinutes <= 45 ? 4 : rec.delayMinutes <= 120 ? 3 : rec.delayMinutes <= 240 ? 2 : 1;
-              rawVal = rec.delayMinutes;
-            } else if (crit.misMetricKey === 'attendance_absence') {
-              scoreVal = rec.absenceDays === 0 ? 5 : rec.absenceDays <= 1 ? 3 : rec.absenceDays <= 2 ? 2 : 1;
-              rawVal = rec.absenceDays;
-            } else if (crit.misMetricKey === 'discipline') {
-              scoreVal = rec.disciplineInfractions === 0 ? 5 : rec.disciplineInfractions === 1 ? 3 : 1;
-              rawVal = rec.disciplineInfractions;
-            } else {
-              scoreVal = Math.max(0, Math.min(5, Math.round(Number(rec.calculatedScore) * 10) / 10));
-              rawVal = rec.delayMinutes;
-            }
-            docVal = `داده کسری: تاخیر ${rec.delayMinutes} دقیقه | غیبت ${rec.absenceDays} روز | تذکر انضباطی ${rec.disciplineInfractions}`;
-            slotsPopulated++;
-          }
-
-          return {
-            cid: item.cid,
-            weight: item.weight,
-            value: scoreVal,
-            self: 0,
-            doc: docVal,
-            sourceType: isKasraCrit ? ('kasra' as const) : effectiveSource === 'supervisor' ? ('supervisor' as const) : undefined,
-            autoPopulated: isKasraCrit,
-            rawMetricValue: rawVal
-          };
-        });
-
-        const initialWorkflow = resolveInitialEvaluationWorkflow(emp, employees, db.getMiscData('pe_route_rules', DEFAULT_ROUTE_RULES), prof.id);
-        const newEv: Evaluation = {
-          id: `eval-${Date.now()}-${Math.random().toString(36).substring(2, 7)}`,
-          empId: emp.id,
-          profileId: prof.id,
-          period: evalPeriod,
-          status: 'draft',
-          ...initialWorkflow,
-          scores,
-          note: 'ایجاد شده خودکار از ایمپورت فایل حضور و غیاب کسری',
-          created: Date.now()
-        };
-        updatedEvaluations.push(newEv);
-        newEvalsCount++;
-      } else {
-        const targetEval = updatedEvaluations[targetIndex];
-        const existingScoreMap = new Map(targetEval.scores.map(s => [s.cid, s]));
-
-        const updatedScores = prof.items.map(item => {
-          const crit = criteria.find(c => c.id === item.cid || c.code === item.cid);
-          const existingScore = existingScoreMap.get(item.cid);
-          const effectiveSource = crit?.scoringSource || (crit?.code.startsWith('B-01') ? 'kasra' : crit?.cat === 'K' ? 'mis' : 'supervisor');
-          const isKasraCrit = crit && effectiveSource === 'kasra' && (crit.autoPopulate !== false);
-
-          if (isKasraCrit) {
-            let scoreVal = 0;
-            let rawVal: number | undefined = undefined;
-
-            if (crit.misMetricKey === 'attendance_delay') {
-              scoreVal = rec.delayMinutes <= 15 ? 5 : rec.delayMinutes <= 45 ? 4 : rec.delayMinutes <= 120 ? 3 : rec.delayMinutes <= 240 ? 2 : 1;
-              rawVal = rec.delayMinutes;
-            } else if (crit.misMetricKey === 'attendance_absence') {
-              scoreVal = rec.absenceDays === 0 ? 5 : rec.absenceDays <= 1 ? 3 : rec.absenceDays <= 2 ? 2 : 1;
-              rawVal = rec.absenceDays;
-            } else if (crit.misMetricKey === 'discipline') {
-              scoreVal = rec.disciplineInfractions === 0 ? 5 : rec.disciplineInfractions === 1 ? 3 : 1;
-              rawVal = rec.disciplineInfractions;
-            } else {
-              scoreVal = Math.max(0, Math.min(5, Math.round(Number(rec.calculatedScore) * 10) / 10));
-              rawVal = rec.delayMinutes;
-            }
-            slotsPopulated++;
-            return {
-              cid: item.cid,
-              weight: item.weight,
-              value: scoreVal,
-              self: existingScore ? existingScore.self : 0,
-              doc: `داده کسری: تاخیر ${rec.delayMinutes} دقیقه | غیبت ${rec.absenceDays} روز | تذکر انضباطی ${rec.disciplineInfractions}`,
-              sourceType: 'kasra' as const,
-              autoPopulated: true,
-              rawMetricValue: rawVal
-            };
-          }
-
-          return existingScore ? { ...existingScore, weight: item.weight } : {
-            cid: item.cid,
-            weight: item.weight,
-            value: 0,
-            self: 0,
-            doc: '',
-            sourceType: effectiveSource === 'supervisor' ? ('supervisor' as const) : undefined
-          };
-        });
-
-        updatedEvaluations[targetIndex] = {
-          ...targetEval,
-          profileId: prof.id,
-          scores: updatedScores
-        };
-        updatedEvalsCount++;
-      }
-    });
-
-    // Immediate multi-layer persistence
-    db.saveEvaluations(updatedEvaluations);
-    onUpdateEvaluations(updatedEvaluations);
-
-    const totalProcessed = newEvalsCount + updatedEvalsCount;
-    setValidationSummary({
-      source: 'سامانه حضور و غیاب کسری',
-      totalProcessed,
-      newEvaluations: newEvalsCount,
-      updatedEvaluations: updatedEvalsCount,
-      slotsPopulated,
-      warnings
-    });
-
-    setSuccessMessage(`نمرات حضور و غیاب کسری برای ${totalProcessed} ارزیابی با موفقیت در اسلات‌های انضباطی ثبت و پایدار شدند (${slotsPopulated} اسلات نمره).`);
+      const scoresUpdated = validRows.reduce((total, row) => total + row.changedScores.length, 0);
+      setKasraApplySummary({
+        rowsRead: kasraPreviewRows.length,
+        employeesMatched: new Set(validRows.map(row => row.employee?.id).filter(Boolean)).size,
+        evaluationsUpdated: updates.size,
+        scoresUpdated,
+        skipped: kasraCounts.invalid,
+        invalid: kasraCounts.invalid,
+        failed: 0,
+      });
+      setValidationSummary({
+        source: 'سامانه حضور و غیاب کسری',
+        totalProcessed: updates.size,
+        newEvaluations: 0,
+        updatedEvaluations: updates.size,
+        slotsPopulated: scoresUpdated,
+        warnings: kasraPreviewRows.filter(row => row.status !== 'valid').map(row => `ردیف ${row.rowNumber}: ${row.issue || row.status}`),
+      });
+      setIsKasraConfirmOpen(false);
+      setSuccessMessage(`درون‌ریزی کسری ذخیره شد: ${kasraPreviewRows.length} ردیف خوانده‌شده، ${updates.size} ارزیابی موجود به‌روزرسانی‌شده، ${scoresUpdated} نمره و یک ذخیره ابری.`);
+    } catch (error) {
+      setErrorMessage(error instanceof Error ? error.message : 'ذخیره درون‌ریزی کسری ناموفق بود.');
+    } finally {
+      setIsKasraApplying(false);
+    }
   };
 
   // --- 6. MIS FILE UPLOAD (LEGACY DIRECT) ---
@@ -707,8 +644,8 @@ export default function ExcelIntegrationCenter({
     }
   };
 
-  const handleApplyMISRecords = () => {
-    if (misRecords.length === 0) return;
+  const handleApplyMISRecords = async () => {
+    if (misRecords.length === 0 || !currentUser || !misImportAllowed) return;
     const currentlyActivePeriod = db.getMiscData<string>('pe_active_period', '').trim();
     if (!currentlyActivePeriod || misRecords.some(record => record.period !== currentlyActivePeriod)) {
       setErrorMessage('دوره فعال پس از پیش‌نمایش تغییر کرده است. فایل را با دوره فعال تازه دوباره اعتبارسنجی کنید.');
@@ -716,6 +653,7 @@ export default function ExcelIntegrationCenter({
       setMisRecords([]);
       return;
     }
+    const selectedPeriodId = canonicalEvaluationPeriodId(currentlyActivePeriod);
 
     let updatedEvaluations = [...evaluations];
     let updatedEvalsCount = 0;
@@ -725,30 +663,32 @@ export default function ExcelIntegrationCenter({
 
     misRecords.forEach((rec, idx) => {
       const rowNum = idx + 1;
-      const emp = employees.find(e => rec.empCode && e.code.toUpperCase() === rec.empCode.toUpperCase());
+      const emp = employees.find(e => rec.empCode && normalizePersonnelCode(e.code) === normalizePersonnelCode(rec.empCode));
 
       if (!emp) {
         warnings.push(`ردیف ${rowNum}: پرسنل با کد «${rec.empCode || 'نامشخص'}» و نام «${rec.empName || 'نامشخص'}» یافت نشد.`);
         return;
       }
 
-      let prof = profiles.find(p => p.id === emp.profileId);
-      if (!prof) {
-        prof = profiles[0];
-        if (prof) {
-          warnings.push(`ردیف ${rowNum} (${emp.name}): فاقد رده شغلی مشخص؛ الگوی «${prof.title}» اعمال شد.`);
-        }
-      }
-
-      if (!prof || !prof.items || prof.items.length === 0) {
-        warnings.push(`ردیف ${rowNum} (${emp.name}): هیچ شاخصی برای رده شغلی تعریف نشده است.`);
+      if (!canImport(currentUser, 'mis', emp, readGranularPermissionPolicy()).allowed) {
+        warnings.push(`ردیف ${rowNum}: مجوز MIS برای محدوده این کارمند وجود ندارد.`);
         return;
       }
 
       const evalPeriod = rec.period;
       let targetIndex = updatedEvaluations.findIndex(
-        ev => ev.empId === emp.id && ev.period === evalPeriod
+        ev => ev.empId === emp.id && getEvaluationPeriodId(ev) === selectedPeriodId
       );
+      if (targetIndex === -1) {
+        warnings.push(`ردیف ${rowNum} (${emp.name}): ارزیابی دوره ${evalPeriod} شروع نشده است؛ ابتدا از عملیات شروع دوره، پرونده واجد شرایط را ایجاد کنید.`);
+        return;
+      }
+      const targetEval = updatedEvaluations[targetIndex];
+      const prof = profiles.find(p => p.id === targetEval.profileId);
+      if (!prof?.items?.length) {
+        warnings.push(`ردیف ${rowNum} (${emp.name}): پروفایل ارزیابی موجود شاخصی ندارد یا پیدا نشد.`);
+        return;
+      }
 
       // Helper function to calculate precise score from MIS record based on misMetricKey
       const computeScoreForMisCriterion = (crit: Criterion) => {
@@ -781,15 +721,16 @@ export default function ExcelIntegrationCenter({
           else scoreVal = 1;
           docVal = `داده خودکار MIS: آزمون کیفی QC به میزان ${rawVal}٪`;
         } else if (crit.misMetricKey === 'output_qty') {
-          rawVal = Number(rec.producedUnits);
+          const produced = Number(rec.producedUnits);
           const target = Number(rec.targetUnits);
-          const ratio = target > 0 ? (rawVal / target) : 1;
+          const ratio = target > 0 ? (produced / target) : 1;
           if (ratio >= 1.04) scoreVal = 5;
           else if (ratio >= 0.98) scoreVal = 4;
           else if (ratio >= 0.90) scoreVal = 3;
           else if (ratio >= 0.80) scoreVal = 2;
           else scoreVal = 1;
-          docVal = `داده خودکار MIS: تیراژ تولید واقعی ${rawVal} قطعه (برنامه مصوب: ${target})`;
+          rawVal = ratio;
+          docVal = `داده خودکار MIS: تیراژ تولید واقعی ${produced} قطعه (برنامه مصوب: ${target})`;
         } else if (crit.misMetricKey === 'downtime') {
           rawVal = Number(rec.downtimeHours) || 0;
           if (rawVal <= 2) scoreVal = 5;
@@ -800,69 +741,57 @@ export default function ExcelIntegrationCenter({
           docVal = `داده خودکار MIS: توقفات فنی دستگاه ${rawVal} ساعت`;
         } else {
           scoreVal = Math.max(0, Math.min(5, Math.round(Number(rec.calculatedKpiScore) * 10) / 10));
-          rawVal = Number(rec.efficiencyRate) || 0;
+          rawVal = Number(rec.calculatedKpiScore);
           docVal = `داده خودکار MIS: راندمان ${rec.efficiencyRate}٪ | ضایعات ${rec.scrapRate}٪ | کیفیت ${rec.qualityScore}٪`;
         }
 
         return { scoreVal, docVal, rawVal };
       };
 
-      if (targetIndex === -1) {
-        warnings.push(`ردیف ${rowNum} (${emp.name}): ارزیابی دوره ${evalPeriod} شروع نشده است؛ ابتدا از عملیات شروع دوره، پرونده واجد شرایط را ایجاد کنید.`);
-        return;
-      } else {
-        const targetEval = updatedEvaluations[targetIndex];
-        const existingScoreMap = new Map(targetEval.scores.map(s => [s.cid, s]));
-
-        const updatedScores = prof.items.map(item => {
-          const crit = criteria.find(c => c.id === item.cid || c.code === item.cid);
-          const existingScore = existingScoreMap.get(item.cid);
-          const effectiveSource = crit?.scoringSource || (crit?.cat === 'K' ? 'mis' : crit?.code.startsWith('B-01') ? 'kasra' : 'supervisor');
-          
-          // STRICT RULE: If criterion source is 'supervisor', preserve supervisor's evaluation intact!
-          const isMISCrit = crit && effectiveSource === 'mis' && (crit.autoPopulate !== false);
-
-          if (isMISCrit) {
-            const computed = computeScoreForMisCriterion(crit);
-            slotsPopulated++;
-            return {
-              ...(existingScore || {}),
-              cid: item.cid,
-              weight: item.weight,
-              value: computed.scoreVal,
-              self: existingScore ? existingScore.self : 0,
-              doc: computed.docVal,
-              sourceType: 'mis' as const,
-              autoPopulated: true,
-              rawMetricValue: computed.rawVal
-            };
-          }
-
-          // If supervisor-scored or non-MIS, preserve existing score completely!
-          return existingScore ? { ...existingScore, weight: item.weight } : {
-            cid: item.cid,
-            weight: item.weight,
-            value: 0,
-            self: 0,
-            doc: '',
-            sourceType: effectiveSource === 'supervisor' ? ('supervisor' as const) : undefined
+      {
+        const profileCriterionIds = new Set(prof.items.map(item => item.cid));
+        const updatedScores = targetEval.scores.map(existingScore => {
+          const criterion = criteria.find(item => item.id === existingScore.cid || item.code === existingScore.cid);
+          if (!profileCriterionIds.has(existingScore.cid) || criterion?.scoringSource !== 'mis' || criterion.autoPopulate === false) return existingScore;
+          const computed = computeScoreForMisCriterion(criterion);
+          slotsPopulated++;
+          return {
+            ...existingScore,
+            value: computed.scoreVal,
+            doc: computed.docVal,
+            sourceType: 'mis' as const,
+            autoPopulated: true,
+            rawMetricValue: computed.rawVal,
+            rawMetricLabel: criterion.misMetricKey === 'output_qty' ? 'output_qty_ratio' :
+              ['efficiency', 'scrap_rate', 'quality_score', 'downtime'].includes(criterion.misMetricKey || '') ? criterion.misMetricKey! : 'mis_composite_score',
           };
         });
 
         updatedEvaluations[targetIndex] = {
           ...targetEval,
-          profileId: prof.id,
           scores: updatedScores
         };
         updatedEvalsCount++;
       }
     });
 
-    // Immediate multi-layer persistence
-    db.saveEvaluations(updatedEvaluations);
-    onUpdateEvaluations(updatedEvaluations);
-
     const totalProcessed = newEvalsCount + updatedEvalsCount;
+    if (!totalProcessed || !slotsPopulated) {
+      setErrorMessage('هیچ معیار MIS معتبر در ارزیابی‌های موجود برای این فایل پیدا نشد.');
+      return;
+    }
+    setIsProcessing(true);
+    const sourceImport: ProtectedSourceImportContext = {
+      importType: 'MIS',
+      operationId: typeof crypto !== 'undefined' && 'randomUUID' in crypto ? crypto.randomUUID() : `mis-${Date.now()}`,
+      evaluationPeriodId: selectedPeriodId,
+    };
+    const accepted = await onUpdateEvaluations(updatedEvaluations, sourceImport);
+    setIsProcessing(false);
+    if (accepted !== true) {
+      setErrorMessage('سرور ذخیره MIS را تأیید نکرد؛ تغییر در ارزیابی‌ها ثبت نشد. بررسی کنید مجوز و اتصال برقرار باشد.');
+      return;
+    }
     setValidationSummary({
       source: 'سامانه تولید و کیفیت MIS',
       totalProcessed,
@@ -879,12 +808,12 @@ export default function ExcelIntegrationCenter({
   // Filtered Dynamic Records for table
   const filteredDynamicRecords = useMemo(() => {
     if (!searchTerm.trim()) return dynamicRecords;
-    const term = searchTerm.trim().toLowerCase();
+    const term = normalizeSearchText(searchTerm);
     return dynamicRecords.filter(r =>
-      r.empCode.toLowerCase().includes(term) ||
-      (r.empName && r.empName.toLowerCase().includes(term)) ||
-      (r.jobTitle && r.jobTitle.toLowerCase().includes(term)) ||
-      (r.unit && r.unit.toLowerCase().includes(term))
+      matchesPersonnelCode(r.empCode, term) ||
+      (r.empName && normalizeSearchText(r.empName).includes(term)) ||
+      (r.jobTitle && normalizeSearchText(r.jobTitle).includes(term)) ||
+      (r.unit && normalizeSearchText(r.unit).includes(term))
     );
   }, [dynamicRecords, searchTerm]);
 
@@ -1717,11 +1646,18 @@ export default function ExcelIntegrationCenter({
                   <div className="space-y-1">
                     <h3 className="text-sm font-black text-slate-100">دریافت و پردازش فایل حضور و غیاب سامانه کسری</h3>
                     <p className="text-xs text-slate-400 leading-relaxed">
-                      محاسبه نمرات انضباط و حضور (۱ تا ۵) بر اساس ساعات کارکرد، دقایق تاخیر و تعجیل، غیبت غیرموجه و تذکرات انضباطی
+                      دوره را انتخاب کنید، فایل را اعتبارسنجی و پیش‌نمایش کنید، سپس فقط اسلات‌های کسری در ارزیابی‌های موجود ذخیره می‌شوند.
                     </p>
+                    <p className="text-[11px] text-teal-200">دوره انتخاب‌شده: <strong>{selectedKasraPeriod?.label || 'انتخاب نشده'}</strong> · شناسه: <span className="font-mono">{selectedKasraPeriodId || '—'}</span></p>
                   </div>
 
                   <div className="flex items-center gap-2.5">
+                    <label className="text-[10px] text-slate-400">دوره ارزیابی
+                      <select aria-label="دوره ارزیابی کسری" value={selectedKasraPeriodId} onChange={event => { setSelectedKasraPeriodId(event.target.value); setKasraApplySummary(null); }} className="mt-1 block rounded-lg border border-slate-700 bg-slate-950 p-2 text-xs text-slate-100">
+                        <option value="">انتخاب دوره</option>
+                        {periodOptions.map(period => <option key={period.id} value={period.id}>{period.label}</option>)}
+                      </select>
+                    </label>
                     <input
                       type="file"
                       ref={kasraFileInputRef}
@@ -1740,52 +1676,67 @@ export default function ExcelIntegrationCenter({
 
                     <button
                       onClick={() => kasraFileInputRef.current?.click()}
-                      disabled={isProcessing}
+                      disabled={isProcessing || !kasraImportAllowed || !selectedKasraPeriodId}
                       className="bg-teal-500 hover:bg-teal-400 text-slate-950 font-black text-xs py-2.5 px-4 rounded-xl shadow-lg shadow-teal-500/20 flex items-center gap-2 cursor-pointer"
                     >
                       <Upload className="w-4 h-4" />
-                      <span>بارگذاری اکسل کسری</span>
+                      <span>{kasraImportAllowed ? 'بارگذاری اکسل کسری' : 'مجوز کسری لازم است'}</span>
                     </button>
                   </div>
                 </div>
+
+                {kasraErrors.length > 0 && <div className="max-h-32 overflow-auto rounded-xl border border-amber-500/25 bg-amber-500/5 p-3 text-[10px] leading-5 text-amber-200" role="status">{kasraErrors.slice(0, 12).map((error, index) => <p key={`${index}:${error}`}>{error}</p>)}</div>}
+
+                {kasraRecords.length > 0 && <div className="grid grid-cols-2 gap-2 sm:grid-cols-4 lg:grid-cols-8" aria-label="خلاصه اعتبارسنجی کسری">
+                  {[
+                    ['کل ردیف‌ها', kasraCounts.total], ['معتبر', kasraCounts.valid], ['نامعتبر', kasraCounts.invalid], ['تکراری', kasraCounts.duplicate],
+                    ['کارمند ناشناخته', kasraCounts.unknownEmployee], ['ارزیابی موجود نیست', kasraCounts.missingEvaluation], ['معیار کسری نیست', kasraCounts.missingCriterion], ['ناسازگاری دوره', kasraCounts.periodMismatch],
+                  ].map(([label, count]) => <div key={String(label)} className="rounded-xl border border-slate-800 bg-slate-900/70 p-2.5 text-[10px] text-slate-400">{label}<strong className="mt-1 block text-sm text-slate-100">{count}</strong></div>)}
+                </div>}
+
+                {kasraApplySummary && <div role="status" className="grid grid-cols-2 gap-2 rounded-xl border border-emerald-500/30 bg-emerald-500/5 p-3 text-[10px] text-emerald-100 sm:grid-cols-4 lg:grid-cols-7">
+                  {Object.entries({ 'ردیف خوانده‌شده': kasraApplySummary.rowsRead, 'کارمند منطبق': kasraApplySummary.employeesMatched, 'ارزیابی به‌روز': kasraApplySummary.evaluationsUpdated, 'نمره به‌روز': kasraApplySummary.scoresUpdated, 'ردیف ردشده': kasraApplySummary.skipped, 'نامعتبر': kasraApplySummary.invalid, 'ناموفق': kasraApplySummary.failed }).map(([label, count]) => <div key={label}>{label}<strong className="mt-1 block text-sm">{count}</strong></div>)}
+                </div>}
 
                 {/* Kasra Records Table */}
                 {kasraRecords.length > 0 && (
                   <div className="space-y-3 pt-4 border-t border-slate-800">
                     <div className="flex items-center justify-between">
-                      <span className="text-xs font-bold text-slate-200">پیش‌نمایش رکوردهای خوانده‌شده از کسری ({kasraRecords.length} پرسنل)</span>
+                      <span className="text-xs font-bold text-slate-200">اعتبارسنجی و پیش‌نمایش کسری ({kasraCounts.valid} ردیف آماده از {kasraRecords.length})</span>
                       <button
-                        onClick={handleApplyKasraRecords}
-                        className="bg-teal-500 hover:bg-teal-400 text-slate-950 font-black text-xs py-1.5 px-4 rounded-xl shadow cursor-pointer flex items-center gap-1.5"
+                        onClick={() => setIsKasraConfirmOpen(true)}
+                        disabled={kasraCounts.valid === 0 || isKasraApplying}
+                        className="bg-teal-500 hover:bg-teal-400 text-slate-950 font-black text-xs py-1.5 px-4 rounded-xl shadow cursor-pointer flex items-center gap-1.5 disabled:opacity-40"
                       >
                         <Save className="w-3.5 h-3.5" />
-                        <span>اعمال آنی بر ارزیابی‌ها</span>
+                        <span>بازبینی و تأیید</span>
                       </button>
                     </div>
 
+                    <label className="flex items-center gap-2 rounded-xl border border-slate-800 bg-slate-950/70 px-3 py-2 text-xs"><Search className="h-4 w-4 text-slate-500" /><input aria-label="جستجوی پیش‌نمایش کسری با کد پرسنلی" value={searchTerm} onChange={event => setSearchTerm(event.target.value)} placeholder="جستجو با نام یا کد پرسنلی" className="w-full bg-transparent outline-none" /></label>
                     <div className="overflow-x-auto max-h-80 rounded-2xl border border-slate-800">
                       <table className="w-full text-right text-xs">
                         <thead className="bg-slate-900 text-slate-300">
                           <tr>
                             <th className="p-2.5">کد</th>
                             <th className="p-2.5">نام</th>
-                            <th className="p-2.5 text-center">دوره</th>
-                            <th className="p-2.5 text-center">تاخیر (دقیقه)</th>
-                            <th className="p-2.5 text-center">غیبت (روز)</th>
-                            <th className="p-2.5 text-center">تذکرات</th>
-                            <th className="p-2.5 text-center">نمره محاسبه‌شده (۱-۵)</th>
+                            <th className="p-2.5 text-center">دوره انتخاب‌شده</th>
+                            <th className="p-2.5 text-center">معیار کسری</th>
+                            <th className="p-2.5 text-center">خام</th>
+                            <th className="p-2.5 text-center">نمره قبل ← بعد</th>
+                            <th className="p-2.5 text-center">اعتبارسنجی</th>
                           </tr>
                         </thead>
                         <tbody className="divide-y divide-slate-800/50">
-                          {kasraRecords.map(r => (
-                            <tr key={r.id} className="hover:bg-slate-900/40">
-                              <td className="p-2.5 font-mono font-bold text-teal-400">{r.empCode}</td>
-                              <td className="p-2.5 font-bold text-slate-200">{r.empName}</td>
-                              <td className="p-2.5 text-center text-slate-400">{r.period}</td>
-                              <td className="p-2.5 text-center text-slate-300">{r.delayMinutes}</td>
-                              <td className="p-2.5 text-center text-slate-300">{r.absenceDays}</td>
-                              <td className="p-2.5 text-center text-slate-300">{r.disciplineInfractions}</td>
-                              <td className="p-2.5 text-center font-bold text-emerald-400">{r.calculatedScore} از ۵</td>
+                          {filteredKasraPreviewRows.map(row => (
+                            <tr key={row.record.id} className={row.status === 'valid' ? 'hover:bg-slate-900/40' : 'bg-rose-500/5'}>
+                              <td className="p-2.5 font-mono font-bold text-teal-400">{row.record.empCode}</td>
+                              <td className="p-2.5 font-bold text-slate-200">{row.employee?.name || row.record.empName || '—'}</td>
+                              <td className="p-2.5 text-center text-slate-400">{selectedKasraPeriod?.label || '—'}</td>
+                              <td className="p-2.5 text-center text-slate-300">{row.changedScores.map(score => score.criterion.name).join('، ') || '—'}</td>
+                              <td className="p-2.5 text-center text-slate-300">{row.changedScores.map(score => score.rawMetricValue).join('، ') || '—'}</td>
+                              <td className="p-2.5 text-center font-bold text-emerald-400">{row.changedScores.map(score => `${score.previousValue} ← ${score.nextValue}`).join('، ') || '—'}</td>
+                              <td className={`p-2.5 text-center ${row.status === 'valid' ? 'text-emerald-300' : 'text-rose-300'}`}>{row.status === 'valid' ? 'معتبر' : row.issue}</td>
                             </tr>
                           ))}
                         </tbody>
@@ -1793,6 +1744,17 @@ export default function ExcelIntegrationCenter({
                     </div>
                   </div>
                 )}
+
+                {isKasraConfirmOpen && <div className="fixed inset-0 z-[100000] flex items-center justify-center bg-slate-950/80 p-4" role="dialog" aria-modal="true" aria-labelledby="kasra-confirm-title">
+                  <div className="w-full max-w-lg space-y-4 rounded-2xl border border-teal-500/30 bg-slate-900 p-5 text-right shadow-2xl">
+                    <h3 id="kasra-confirm-title" className="text-sm font-black text-slate-100">تأیید درون‌ریزی کسری</h3>
+                    <p className="text-xs leading-6 text-slate-300">دوره: <strong>{selectedKasraPeriod?.label}</strong> · شناسه دوره: <code>{selectedKasraPeriodId}</code>. پس از تأیید، {kasraCounts.valid} ردیف معتبر در ارزیابی‌های موجود به‌روزرسانی می‌شود؛ {kasraCounts.invalid} ردیف رد می‌شود. پیش از این دکمه هیچ ارزیابی ذخیره نشده است.</p>
+                    <div className="flex justify-end gap-2">
+                      <button type="button" onClick={() => setIsKasraConfirmOpen(false)} disabled={isKasraApplying} className="rounded-xl bg-slate-700 px-4 py-2 text-xs font-bold text-white">لغو؛ بدون ذخیره</button>
+                      <button type="button" onClick={handleApplyKasraRecords} disabled={isKasraApplying || kasraCounts.valid === 0} className="rounded-xl bg-teal-500 px-4 py-2 text-xs font-black text-slate-950 disabled:opacity-50">{isKasraApplying ? 'در حال ذخیره…' : `تأیید ${kasraCounts.valid} ردیف`}</button>
+                    </div>
+                  </div>
+                </div>}
               </div>
             </div>
           )}
@@ -1835,11 +1797,11 @@ export default function ExcelIntegrationCenter({
 
                     <button
                       onClick={() => misFileInputRef.current?.click()}
-                      disabled={isProcessing || !db.getMiscData<string>('pe_active_period', '').trim()}
+                      disabled={isProcessing || !misImportAllowed || !db.getMiscData<string>('pe_active_period', '').trim()}
                       className="bg-emerald-500 hover:bg-emerald-400 text-slate-950 font-black text-xs py-2.5 px-4 rounded-xl shadow-lg shadow-emerald-500/20 flex items-center gap-2 cursor-pointer"
                     >
                       <Upload className="w-4 h-4" />
-                      <span>بارگذاری اکسل MIS</span>
+                      <span>{misImportAllowed ? 'بارگذاری اکسل MIS' : 'مجوز MIS لازم است'}</span>
                     </button>
                   </div>
                 </div>
@@ -1870,6 +1832,7 @@ export default function ExcelIntegrationCenter({
                       </button>
                     </div>
 
+                    <label className="flex items-center gap-2 rounded-xl border border-slate-800 bg-slate-950/70 px-3 py-2 text-xs"><Search className="h-4 w-4 text-slate-500" /><input aria-label="جستجوی پیش‌نمایش MIS با کد پرسنلی" value={searchTerm} onChange={event => setSearchTerm(event.target.value)} placeholder="جستجو با نام یا کد پرسنلی" className="w-full bg-transparent outline-none" /></label>
                     <div className="overflow-x-auto max-h-80 rounded-2xl border border-slate-800">
                       <table className="w-full text-right text-xs">
                         <thead className="bg-slate-900 text-slate-300">
@@ -1884,7 +1847,7 @@ export default function ExcelIntegrationCenter({
                           </tr>
                         </thead>
                         <tbody className="divide-y divide-slate-800/50">
-                          {misRecords.map(r => (
+                          {filteredMisRecords.map(r => (
                             <tr key={r.id} className="hover:bg-slate-900/40">
                               <td className="p-2.5 font-mono font-bold text-emerald-400">{r.empCode}</td>
                               <td className="p-2.5 font-bold text-slate-200">{r.empName}</td>

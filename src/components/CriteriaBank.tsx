@@ -40,6 +40,8 @@ import UniversalDataExchange, { DataExchangeConfig } from './UniversalDataExchan
 import KpiFormulaEngineModal from './KpiFormulaEngineModal';
 import MultiSourceCriteriaImportModal, { MergeStrategy } from './MultiSourceCriteriaImportModal';
 import { db } from '../utils/db';
+import { canImport } from '../utils/authorization';
+import type { MasterDataSourceImportContext } from '../utils/sourceImports';
 
 interface CriteriaBankProps {
   criteria: Criterion[];
@@ -49,8 +51,10 @@ interface CriteriaBankProps {
   onBulkDeleteCriteria?: (ids: string[]) => void;
   onBatchAddCriteria?: (
     newOrUpdatedList: Array<Omit<Criterion, 'id'> & { id?: string }>,
-    mode?: MergeStrategy
-  ) => void;
+    mode?: MergeStrategy,
+    sourceImport?: MasterDataSourceImportContext,
+  ) => boolean | Promise<boolean>;
+  currentUser?: Employee | null;
   employees?: Employee[];
   profiles?: JobProfile[];
   evaluations?: Evaluation[];
@@ -109,12 +113,14 @@ export default function CriteriaBank({
   onDeleteCriterion,
   onBulkDeleteCriteria,
   onBatchAddCriteria,
+  currentUser,
   employees = [],
   profiles = [],
   evaluations = [],
   onUpdateEvaluations,
   theme = 'dark'
 }: CriteriaBankProps) {
+  const criteriaImportAllowed = Boolean(currentUser && canImport(currentUser, 'criteria').allowed);
   const [searchTerm, setSearchTerm] = useState('');
   const [selectedCat, setSelectedCat] = useState<CategoryKey | 'ALL'>('ALL');
 
@@ -137,28 +143,124 @@ export default function CriteriaBank({
   const [bulkText, setBulkText] = useState('');
   const [bulkStatusMsg, setBulkStatusMsg] = useState<{ text: string; type: 'success' | 'error' | 'info' } | null>(null);
 
-  const handleCommitMultiSource = (
+  const handleCommitMultiSource = async (
     mergedCriteria: Array<Omit<Criterion, 'id'> & { id?: string }>,
     strategy: MergeStrategy,
     stats: { total: number; added: number; updated: number; departments: string[] }
-  ) => {
+  ): Promise<boolean> => {
+    const sourceImport: MasterDataSourceImportContext = {
+      importType: 'CRITERIA',
+      operationId: `criteria:${crypto.randomUUID()}`,
+    };
+    let accepted = true;
     if (onBatchAddCriteria) {
-      onBatchAddCriteria(mergedCriteria, strategy);
+      accepted = await onBatchAddCriteria(mergedCriteria, strategy, sourceImport);
     } else {
       const mode = strategy === 'replace' ? 'replace' : strategy === 'skip_existing' ? 'skip_existing' : 'merge';
       db.saveCriteriaBatch(mergedCriteria, mode);
+    }
+    if (!accepted) {
+      setMultiSourceNotice('درون‌ریزی از سوی سرور پذیرفته نشد؛ بانک معیارها تغییری نکرد.');
+      setTimeout(() => setMultiSourceNotice(null), 8000);
+      return false;
     }
 
     setMultiSourceNotice(
       `تلفیق موفقیت‌آمیز: تعداد ${stats.total} شاخص از ${stats.departments.length} بخش سازمانی با موفقیت در بانک شاخص‌ها ثبت شد (${stats.added} شاخص جدید، ${stats.updated} به‌روزرسانی).`
     );
     setTimeout(() => setMultiSourceNotice(null), 8000);
+    return true;
+  };
+
+  const buildCriteriaImportPlan = (importedItems: any[], mode: 'merge' | 'replace') => {
+    const candidates: Array<Omit<Criterion, 'id'> & { id?: string }> = [];
+    const rows: Array<{ rowNumber: number; status: string; name: string; code: string; issues?: string[] }> = [];
+    const errors: string[] = [];
+    const seenCodes = new Set<string>();
+    let newCount = 0;
+    let updateCount = 0;
+    let duplicateCount = 0;
+    let unchangedCount = 0;
+
+    importedItems.forEach((item: any, index: number) => {
+      const rowNum = index + 1;
+      const rawCode = String(item.code || item['کد شاخص'] || '').trim();
+      const rawName = String(item.name || item['عنوان شاخص'] || '').trim();
+      const rawCat = (String(item.cat || item['دسته‌بندی (K/B)'] || item['دسته‌بندی'] || 'K').toUpperCase().startsWith('B') ? 'B' : 'K') as CategoryKey;
+      const rawDef = String(item.def || item['تعریف عملیاتی و سنجه'] || item['تعریف عملیاتی'] || '').trim();
+      const rawSource = String(item.source || item['منبع داده و استخراج'] || item['منبع داده'] || '').trim();
+      const rawMethod = String(item.method || item['روش و فرمول سنجش'] || item['روش سنجش'] || '').trim();
+      const rawDir = (String(item.dir || item['جهت مطلوبیت (more/less)'] || item['جهت مطلوبیت'] || 'more') === 'less' ? 'less' : 'more') as 'more' | 'less';
+      const candidate = {
+        code: rawCode, name: rawName, cat: rawCat, def: rawDef, source: rawSource, method: rawMethod, dir: rawDir,
+        targetValue: item.targetValue ?? item['مقدار هدف'] ?? undefined,
+        scoreThresholds: ['score5', 'score4', 'score3', 'score2'].some(key => item[key] !== undefined && item[key] !== '')
+          ? { score5: Number(item.score5), score4: Number(item.score4), score3: Number(item.score3), score2: Number(item.score2) }
+          : item.scoreThresholds,
+        allowedScoreMin: item.allowedScoreMin ?? item['حداقل نمره مجاز'] ?? undefined,
+        allowedScoreMax: item.allowedScoreMax ?? item['حداکثر نمره مجاز'] ?? undefined,
+        scoringSource: item.scoringSource, formulaExpression: item.formulaExpression, calculationType: item.calculationType,
+        variables: item.variables, unit: item.unit, multiSourceConfig: item.multiSourceConfig, misMetricKey: item.misMetricKey,
+        customMetricField: item.customMetricField, autoPopulate: item.autoPopulate, misTargetValue: item.misTargetValue,
+      };
+      const normalizedCode = rawCode.trim().toLocaleUpperCase();
+      if (normalizedCode && seenCodes.has(normalizedCode)) {
+        duplicateCount++;
+        const issue = 'Duplicate criterion code in this import.';
+        errors.push(`سطر ${rowNum} (${rawCode}): کد معیار در همین فایل تکراری است.`);
+        rows.push({ rowNumber: rowNum, status: 'DUPLICATE', name: rawName || '—', code: rawCode || '—', issues: [issue] });
+        return;
+      }
+      if (normalizedCode) seenCodes.add(normalizedCode);
+
+      const validation = validateCriterionInput(candidate);
+      if (!validation.success) {
+        errors.push(`سطر ${rowNum} (${rawCode || 'بدون کد'}): ${validation.errors.join('، ')}`);
+        rows.push({ rowNumber: rowNum, status: 'INVALID', name: rawName || '—', code: rawCode || '—', issues: validation.errors });
+        return;
+      }
+
+      const valid = validation.data;
+      const existing = criteria.find(criterion => criterion.code.trim().toLocaleUpperCase() === valid.code.trim().toLocaleUpperCase());
+      const merged = existing ? { ...mergeCriterionEdit(existing, valid), id: existing.id } : valid;
+      const unchanged = Boolean(existing && JSON.stringify(existing) === JSON.stringify(merged));
+      if (!unchanged || mode === 'replace') candidates.push(merged);
+      if (unchanged) unchangedCount++;
+      else if (existing) updateCount++;
+      else newCount++;
+      rows.push({ rowNumber: rowNum, status: unchanged ? 'UNCHANGED' : existing ? 'UPDATE' : 'NEW', name: valid.name, code: valid.code });
+    });
+
+    return { candidates, rows, errors, newCount, updateCount, duplicateCount, unchangedCount };
+  };
+
+  const applyCriteriaImportPlan = async (
+    plan: ReturnType<typeof buildCriteriaImportPlan>,
+    mode: 'merge' | 'replace',
+  ) => {
+    if (!plan.candidates.length) return { count: 0, message: 'No criteria changes were required.', errors: plan.errors };
+    const projected = db.prepareCriteriaBatch(plan.candidates, mode === 'replace' ? 'replace' : 'merge').criteria;
+    if (JSON.stringify(projected) === JSON.stringify(criteria)) {
+      return { count: 0, message: 'No criteria changes were required.', errors: plan.errors };
+    }
+    const sourceImport: MasterDataSourceImportContext = { importType: 'CRITERIA', operationId: `criteria:${crypto.randomUUID()}` };
+    const accepted = onBatchAddCriteria
+      ? await onBatchAddCriteria(plan.candidates, mode, sourceImport)
+      : (db.saveCriteriaBatch(plan.candidates, mode), true);
+    if (!accepted) return { count: 0, message: 'درون‌ریزی از سوی سرور پذیرفته نشد؛ بانک معیارها تغییری نکرد.', errors: [...plan.errors, 'criteria_import_not_authorized_or_invalid'] };
+    return {
+      count: plan.candidates.length,
+      message: `درون‌ریزی معیارها انجام شد: ${plan.newCount} جدید، ${plan.updateCount} به‌روزرسانی، ${plan.unchangedCount} بدون تغییر، ${plan.duplicateCount} تکراری، ${plan.errors.length} نامعتبر.`,
+      errors: plan.errors,
+    };
   };
 
   const criteriaExchangeConfig: DataExchangeConfig<Criterion> = {
     entityName: 'بانک مرکزی شاخص‌ها و سنجه‌ها',
     entityKey: 'criteria',
     items: criteria,
+    canImport: criteriaImportAllowed,
+    importUnavailableMessage: 'برای درون‌ریزی معیارها باید مجوز CRITERIA_IMPORT برای حساب شما فعال باشد.',
     csvHeaders: [
       { key: 'code', label: 'کد شاخص' },
       { key: 'name', label: 'عنوان شاخص' },
@@ -179,72 +281,18 @@ export default function CriteriaBank({
       { 'کد شاخص': 'K-PRD-10', 'عنوان شاخص': 'درصد تحقق برنامه خط مونتاژ', 'دسته‌بندی (K/B)': 'K', 'تعریف عملیاتی و سنجه': 'تولید واقعی تقسیم بر برنامه مصوب', 'منبع داده و استخراج': 'سیستم MES', 'روش و فرمول سنجش': 'درصد کمی', 'جهت مطلوبیت (more/less)': 'more' },
       { 'کد شاخص': 'B-HSE-02', 'عنوان شاخص': 'رعایت نظم و ایمنی صنعتی', 'دسته‌بندی (K/B)': 'B', 'تعریف عملیاتی و سنجه': 'رعایت کلیه موارد ایمنی و ۵اس', 'منبع داده و استخراج': 'ممیزی HSE', 'روش و فرمول سنجش': 'مقیاس ۱ تا ۵', 'جهت مطلوبیت (more/less)': 'more' }
     ],
-    onImport: (importedItems, mode) => {
-      let count = 0;
-      const errors: string[] = [];
-
-      importedItems.forEach((item: any, index: number) => {
-        const rowNum = index + 1;
-        const rawCode = (item.code || item['کد شاخص'] || `C-${Math.floor(Math.random() * 1000)}`).trim();
-        const rawName = (item.name || item['عنوان شاخص'] || 'شاخص جدید').trim();
-        const rawCat = ((item.cat || item['دسته‌بندی (K/B)'] || item['دسته‌بندی'] || 'K').toString().toUpperCase().startsWith('B') ? 'B' : 'K') as CategoryKey;
-        const rawDef = (item.def || item['تعریف عملیاتی و سنجه'] || item['تعریف عملیاتی'] || `تعریف عملیاتی شاخص ${rawName}`).trim();
-        const rawSource = (item.source || item['منبع داده و استخراج'] || item['منبع داده'] || 'سیستم کارخانه').trim();
-        const rawMethod = (item.method || item['روش و فرمول سنجش'] || item['روش سنجش'] || 'سنجش دوره‌ای').trim();
-        const rawDir = ((item.dir || item['جهت مطلوبیت (more/less)'] || item['جهت مطلوبیت'] || 'more') === 'less' ? 'less' : 'more') as 'more' | 'less';
-
-        const candidate = {
-          code: rawCode,
-          name: rawName,
-          cat: rawCat,
-          def: rawDef,
-          source: rawSource,
-          method: rawMethod,
-          dir: rawDir,
-          targetValue: item.targetValue ?? item['مقدار هدف'] ?? undefined,
-          scoreThresholds: ['score5', 'score4', 'score3', 'score2'].some(key => item[key] !== undefined && item[key] !== '')
-            ? { score5: Number(item.score5), score4: Number(item.score4), score3: Number(item.score3), score2: Number(item.score2) }
-            : item.scoreThresholds,
-          allowedScoreMin: item.allowedScoreMin ?? item['حداقل نمره مجاز'] ?? undefined,
-          allowedScoreMax: item.allowedScoreMax ?? item['حداکثر نمره مجاز'] ?? undefined,
-          scoringSource: item.scoringSource,
-          formulaExpression: item.formulaExpression,
-          calculationType: item.calculationType,
-          variables: item.variables,
-          unit: item.unit,
-          multiSourceConfig: item.multiSourceConfig,
-          misMetricKey: item.misMetricKey,
-          customMetricField: item.customMetricField,
-          autoPopulate: item.autoPopulate,
-          misTargetValue: item.misTargetValue,
-        };
-
-        const validation = validateCriterionInput(candidate);
-        if (!validation.success) {
-          errors.push(`سطر ${rowNum} (${rawCode}): ${validation.errors.join('، ')}`);
-          return;
-        }
-
-        const validCrit = validation.data;
-        const existing = criteria.find(c => c.code.toLowerCase() === validCrit.code.toLowerCase());
-
-        if (existing) {
-          if (mode === 'replace' || mode === 'merge') {
-            const ok = onUpdateCriterion(existing.id, mergeCriterionEdit(existing, validCrit));
-            if (ok) count++;
-          }
-        } else {
-          const ok = onAddCriterion(validCrit);
-          if (ok) count++;
-        }
-      });
-
+    onImport: async (importedItems, mode) => applyCriteriaImportPlan(buildCriteriaImportPlan(importedItems, mode), mode),
+    prepareImport: (importedItems, mode) => {
+      const plan = buildCriteriaImportPlan(importedItems, mode);
       return {
-        count,
-        message: `تعداد ${count} شاخص شایستگی با موفقیت در بانک شاخص‌ها ثبت و به‌روزرسانی شد.`,
-        errors
+        preview: {
+          rows: plan.rows,
+          counts: { NEW: plan.newCount, UPDATE: plan.updateCount, UNCHANGED: plan.unchangedCount, DUPLICATE: plan.duplicateCount, INVALID: plan.errors.length },
+          changedCount: plan.newCount + plan.updateCount,
+        },
+        commit: () => applyCriteriaImportPlan(plan, mode),
       };
-    }
+    },
   };
   
   // Form values
@@ -372,31 +420,37 @@ export default function CriteriaBank({
   };
 
   // Bulk Import Handlers
-  const handleLoadPreset = (presetItems: typeof PRESET_LIBRARIES[0]['items']) => {
-    let addedCount = 0;
-    presetItems.forEach(item => {
-      const exists = criteria.some(c => c.code.toLowerCase() === item.code.toLowerCase());
-      if (!exists) {
-        const ok = onAddCriterion(item);
-        if (ok) addedCount++;
-      }
-    });
-
-    if (addedCount > 0) {
-      setBulkStatusMsg({ text: `تعداد ${addedCount} معیار استاندارد با موفقیت به بانک شاخص‌ها افزوده شد.`, type: 'success' });
-    } else {
-      setBulkStatusMsg({ text: 'تمامی معیارهای این بسته از قبل در بانک شاخص‌ها وجود دارند.', type: 'info' });
+  const handleLoadPreset = async (presetItems: typeof PRESET_LIBRARIES[0]['items']) => {
+    if (!criteriaImportAllowed) {
+      setBulkStatusMsg({ text: 'مجوز درون‌ریزی معیارها برای این کاربر فعال نیست.', type: 'error' });
+      return;
     }
+    const candidates = presetItems.filter(item => !criteria.some(c => c.code.toLocaleUpperCase() === item.code.toLocaleUpperCase()));
+    if (!candidates.length) {
+      setBulkStatusMsg({ text: 'تمامی معیارهای این بسته از قبل در بانک شاخص‌ها وجود دارند.', type: 'info' });
+      return;
+    }
+    const sourceImport: MasterDataSourceImportContext = { importType: 'CRITERIA', operationId: `criteria:${crypto.randomUUID()}` };
+    const accepted = onBatchAddCriteria
+      ? await onBatchAddCriteria(candidates, 'merge', sourceImport)
+      : (db.saveCriteriaBatch(candidates, 'merge'), true);
+    setBulkStatusMsg(accepted
+      ? { text: `تعداد ${candidates.length} معیار استاندارد با موفقیت به بانک شاخص‌ها افزوده شد.`, type: 'success' }
+      : { text: 'درون‌ریزی از سوی سرور پذیرفته نشد و داده محلی تغییر نکرد.', type: 'error' });
   };
 
-  const handleProcessBulkText = () => {
+  const handleProcessBulkText = async () => {
+    if (!criteriaImportAllowed) {
+      setBulkStatusMsg({ text: 'مجوز درون‌ریزی معیارها برای این کاربر فعال نیست.', type: 'error' });
+      return;
+    }
     if (!bulkText.trim()) {
       setBulkStatusMsg({ text: 'لطفاً خطوط اطلاعات معیارها را در کادر متنی وارد کنید.', type: 'error' });
       return;
     }
 
     const lines = bulkText.split('\n').map(l => l.trim()).filter(l => l.length > 0);
-    let addedCount = 0;
+    const candidates: Array<Omit<Criterion, 'id'>> = [];
 
     lines.forEach(line => {
       const parts = line.includes('\t') ? line.split('\t') : line.split(',');
@@ -410,26 +464,23 @@ export default function CriteriaBank({
         const dir = (parts[6]?.trim() === 'less' ? 'less' : 'more') as 'more' | 'less';
 
         if (code && name) {
-          const exists = criteria.some(c => c.code.toLowerCase() === code.toLowerCase());
-          if (!exists) {
-            const ok = onAddCriterion({
-              code,
-              cat,
-              name,
-              def,
-              source,
-              method,
-              dir: cat === 'K' ? dir : undefined
-            });
-            if (ok) addedCount++;
-          }
+          const exists = criteria.some(c => c.code.toLocaleUpperCase() === code.toLocaleUpperCase());
+          if (!exists) candidates.push({ code, cat, name, def, source, method, dir: cat === 'K' ? dir : undefined });
         }
       }
     });
 
-    if (addedCount > 0) {
-      setBulkStatusMsg({ text: `تعداد ${addedCount} معیار جدید با موفقیت به بانک اضافه شدند.`, type: 'success' });
-      setBulkText('');
+    if (candidates.length > 0) {
+      const sourceImport: MasterDataSourceImportContext = { importType: 'CRITERIA', operationId: `criteria:${crypto.randomUUID()}` };
+      const accepted = onBatchAddCriteria
+        ? await onBatchAddCriteria(candidates, 'merge', sourceImport)
+        : (db.saveCriteriaBatch(candidates, 'merge'), true);
+      if (accepted) {
+        setBulkStatusMsg({ text: `تعداد ${candidates.length} معیار جدید با موفقیت به بانک اضافه شدند.`, type: 'success' });
+        setBulkText('');
+      } else {
+        setBulkStatusMsg({ text: 'درون‌ریزی از سوی سرور پذیرفته نشد و داده محلی تغییر نکرد.', type: 'error' });
+      }
     } else {
       setBulkStatusMsg({ text: 'هیچ معیار جدیدی اضافه نشد. لطفاً ساختار داده‌ها را بررسی فرمایید.', type: 'error' });
     }
@@ -499,7 +550,8 @@ export default function CriteriaBank({
           <button
             type="button"
             onClick={() => setIsMultiSourceModalOpen(true)}
-            className="min-h-11 bg-white hover:bg-slate-50 text-slate-700 dark:bg-slate-900/70 dark:hover:bg-slate-800 dark:text-slate-200 font-semibold px-4 py-2.5 rounded-xl text-xs flex items-center gap-2 border border-slate-200 dark:border-slate-700 transition-colors cursor-pointer"
+            disabled={!criteriaImportAllowed}
+            className="min-h-11 bg-white hover:bg-slate-50 text-slate-700 dark:bg-slate-900/70 dark:hover:bg-slate-800 dark:text-slate-200 font-semibold px-4 py-2.5 rounded-xl text-xs flex items-center gap-2 border border-slate-200 dark:border-slate-700 transition-colors cursor-pointer disabled:opacity-40 disabled:cursor-not-allowed"
           >
             <Layers className="w-4 h-4" />
             <span>ورود چندبخشی و تلفیق شاخص‌ها (XLSX/CSV/JSON)</span>
@@ -527,7 +579,8 @@ export default function CriteriaBank({
               setBulkStatusMsg(null);
               setIsBulkModalOpen(true);
             }}
-            className="min-h-11 bg-white hover:bg-slate-50 text-slate-700 dark:bg-slate-900/70 dark:hover:bg-slate-800 dark:text-slate-200 border border-slate-200 dark:border-slate-700 font-semibold px-3.5 py-2.5 rounded-xl text-xs flex items-center gap-2 transition-colors cursor-pointer"
+            disabled={!criteriaImportAllowed}
+            className="min-h-11 bg-white hover:bg-slate-50 text-slate-700 dark:bg-slate-900/70 dark:hover:bg-slate-800 dark:text-slate-200 border border-slate-200 dark:border-slate-700 font-semibold px-3.5 py-2.5 rounded-xl text-xs flex items-center gap-2 transition-colors cursor-pointer disabled:opacity-40 disabled:cursor-not-allowed"
           >
             <UploadCloud className="w-4 h-4" />
             <span>بسته‌های استاندارد آماده</span>
@@ -949,7 +1002,8 @@ export default function CriteriaBank({
                     <button
                       type="button"
                       onClick={() => handleLoadPreset(preset.items)}
-                      className={`mt-3 w-full font-bold py-1.5 rounded-xl text-xs flex items-center justify-center gap-1.5 transition-all cursor-pointer ${
+                      disabled={!criteriaImportAllowed}
+                      className={`mt-3 w-full font-bold py-1.5 rounded-xl text-xs flex items-center justify-center gap-1.5 transition-all cursor-pointer disabled:opacity-40 disabled:cursor-not-allowed ${
                         theme === 'dark' ? 'bg-teal-500/10 hover:bg-teal-500/20 text-teal-300 border border-teal-500/20' : 'bg-teal-50 hover:bg-teal-100 text-teal-700 border border-teal-200'
                       }`}
                     >

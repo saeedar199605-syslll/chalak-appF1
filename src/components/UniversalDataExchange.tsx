@@ -35,15 +35,17 @@ export interface PreparedImport {
     changedCount: number;
     removedCount?: number;
   };
-  commit: () => { count: number; message?: string; errors?: string[] };
+  commit: () => { count: number; message?: string; errors?: string[] } | Promise<{ count: number; message?: string; errors?: string[] }>;
 }
 
 export interface DataExchangeConfig<T> {
   entityName: string; // e.g. 'بانک شاخص‌های شایستگی', 'پروفایل‌های شغلی', 'مدیریت پرسنل', 'ارزیابی‌ها'
   entityKey: string; // e.g. 'criteria', 'job_profiles', 'employees', 'evaluations'
   items: T[];
-  onImport: (importedItems: any[], mode: 'merge' | 'replace') => { count: number; message?: string; errors?: string[] };
+  onImport: (importedItems: any[], mode: 'merge' | 'replace') => { count: number; message?: string; errors?: string[] } | Promise<{ count: number; message?: string; errors?: string[] }>;
   prepareImport?: (importedItems: any[], mode: 'merge' | 'replace') => PreparedImport;
+  canImport?: boolean;
+  importUnavailableMessage?: string;
   csvHeaders: { key: keyof T | string; label: string; accessor?: (item: T) => any }[];
   templateSampleRows?: Record<string, string>[];
 }
@@ -68,6 +70,7 @@ export default function UniversalDataExchange<T>({
   const [rawTextInput, setRawTextInput] = useState('');
   const [statusMessage, setStatusMessage] = useState<{ type: 'success' | 'error' | 'info'; text: string; errors?: string[] } | null>(null);
   const [pendingImport, setPendingImport] = useState<PreparedImport | null>(null);
+  const [isCommitting, setIsCommitting] = useState(false);
   const fileInputRef = useRef<HTMLInputElement | null>(null);
   const importCommitStartedRef = useRef(false);
   const lastExternalImportIdRef = useRef<string | null>(null);
@@ -76,6 +79,12 @@ export default function UniversalDataExchange<T>({
     if (!isOpen || !externalImportRequest || !config.prepareImport || lastExternalImportIdRef.current === externalImportRequest.id) return;
     lastExternalImportIdRef.current = externalImportRequest.id;
     const mode = externalImportRequest.mode || 'merge';
+    if (config.canImport === false) {
+      setActiveTab('export');
+      setPendingImport(null);
+      setStatusMessage({ type: 'error', text: config.importUnavailableMessage || 'You are not authorized to import this data.' });
+      return;
+    }
     setActiveTab('import');
     setImportMode(mode);
     setStatusMessage(null);
@@ -233,8 +242,12 @@ export default function UniversalDataExchange<T>({
   };
 
   // 4. PARSE AND PROCESS IMPORT
-  const processImportString = (content: string) => {
+  const processImportString = async (content: string) => {
     try {
+      if (config.canImport === false) {
+        setStatusMessage({ type: 'error', text: config.importUnavailableMessage || 'You are not authorized to import this data.' });
+        return;
+      }
       let parsedItems: any[] = [];
       const trimmed = content.trim();
 
@@ -286,7 +299,7 @@ export default function UniversalDataExchange<T>({
         return;
       }
 
-      const result = config.onImport(parsedItems, importMode);
+      const result = await config.onImport(parsedItems, importMode);
       setStatusMessage({
         type: result.errors && result.errors.length > 0 && result.count === 0 ? 'error' : 'success',
         text: result.message || `تعداد ${result.count} رکورد با موفقیت پردازش و در سامانه ثبت گردید.`,
@@ -305,11 +318,12 @@ export default function UniversalDataExchange<T>({
     importCommitStartedRef.current = false;
   };
 
-  const confirmPreparedImport = () => {
+  const confirmPreparedImport = async () => {
     if (!pendingImport || importCommitStartedRef.current) return;
     importCommitStartedRef.current = true;
+    setIsCommitting(true);
     try {
-      const result = pendingImport.commit();
+      const result = await pendingImport.commit();
       setPendingImport(null);
       setStatusMessage({
         type: result.errors?.length && result.count === 0 ? 'error' : 'success',
@@ -318,6 +332,8 @@ export default function UniversalDataExchange<T>({
       });
     } catch (error) {
       setStatusMessage({ type: 'error', text: `Import could not be applied: ${error instanceof Error ? error.message : String(error)}` });
+    } finally {
+      setIsCommitting(false);
     }
   };
 
@@ -421,7 +437,7 @@ export default function UniversalDataExchange<T>({
           isDark ? 'border-slate-800 bg-slate-950/60' : 'border-slate-200 bg-slate-100/70'
         }`}>
           <button
-            disabled={Boolean(pendingImport)}
+            disabled={Boolean(pendingImport) || isCommitting}
             onClick={() => { setActiveTab('export'); setStatusMessage(null); }}
             className={`flex-1 py-2.5 px-4 rounded-xl text-xs font-bold flex items-center justify-center gap-2 transition-all cursor-pointer ${
               activeTab === 'export'
@@ -433,9 +449,9 @@ export default function UniversalDataExchange<T>({
             <span>خروجی گرفتن و دانلود (Export)</span>
           </button>
           <button
-            disabled={Boolean(pendingImport)}
+            disabled={Boolean(pendingImport) || isCommitting || config.canImport === false}
             onClick={() => { setActiveTab('import'); setStatusMessage(null); }}
-            className={`flex-1 py-2.5 px-4 rounded-xl text-xs font-bold flex items-center justify-center gap-2 transition-all cursor-pointer ${
+            className={`flex-1 py-2.5 px-4 rounded-xl text-xs font-bold flex items-center justify-center gap-2 transition-all cursor-pointer disabled:opacity-40 disabled:cursor-not-allowed ${
               activeTab === 'import'
                 ? 'bg-red-600 text-white shadow-md font-black'
                 : isDark ? 'text-slate-400 hover:text-white hover:bg-slate-800/50' : 'text-slate-600 hover:text-slate-900 hover:bg-white/80'

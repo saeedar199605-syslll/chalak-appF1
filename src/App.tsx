@@ -86,6 +86,11 @@ export default function App() {
   const [activeTourStep, setActiveTourStep] = useState<number | null>(null);
   const [isManualModalOpen, setIsManualModalOpen] = useState(false);
   const [sessionChecked, setSessionChecked] = useState(false);
+  const sessionRestorePromiseRef = useRef<Promise<{
+    isApiResponse: boolean;
+    responseOk: boolean;
+    result?: { user?: Employee; error?: string };
+  }> | null>(null);
 
   const sanitizeUser = (user: Employee | null): Employee | null => {
     if (!user) return null;
@@ -122,18 +127,29 @@ export default function App() {
   // authoritative for role or permissions in production.
   useEffect(() => {
     let active = true;
+    const hasSessionHint = Boolean(sessionStorage.getItem('pe_session_user') || localStorage.getItem('pe_server_session_hint'));
+    if (!hasSessionHint) {
+      setCurrentUser(null);
+      setSessionChecked(true);
+      return () => { active = false; };
+    }
     const restoreServerSession = async () => {
       try {
-        const response = await fetch('/api/auth/session', { credentials: 'same-origin' });
-        const isApiResponse = (response.headers.get('Content-Type') || '').includes('application/json');
+        const restorePromise = sessionRestorePromiseRef.current || (sessionRestorePromiseRef.current = fetch('/api/auth/session', { credentials: 'same-origin' }).then(async response => {
+          const isApiResponse = (response.headers.get('Content-Type') || '').includes('application/json');
+          const result = isApiResponse ? await response.json() as { user?: Employee; error?: string } : undefined;
+          return { isApiResponse, responseOk: response.ok, result };
+        }));
+        const { isApiResponse, responseOk, result } = await restorePromise;
         if (isApiResponse) {
-          const result = await response.json() as { user?: Employee; error?: string };
           if (!active) return;
-          if (response.ok && result.user) {
+          if (responseOk && result?.user) {
             sessionStorage.setItem('pe_session_user', JSON.stringify(result.user));
+            localStorage.setItem('pe_server_session_hint', '1');
             setCurrentUser(result.user);
             setCurrentTab(restoreNavigationFor(result.user));
           } else {
+            localStorage.removeItem('pe_server_session_hint');
             clearLegacyAdminSessions();
             setCurrentUser(null);
           }
@@ -421,6 +437,7 @@ export default function App() {
     const sanitized = sanitizeUser(emp);
     if (!sanitized) return;
     sessionStorage.setItem('pe_session_user', JSON.stringify(sanitized));
+    if (!import.meta.env.DEV) localStorage.setItem('pe_server_session_hint', '1');
     if (sanitized.role === 'admin') {
       sessionStorage.setItem('pe_admin_session_logged_at', new Date().toISOString());
     }
@@ -460,6 +477,7 @@ export default function App() {
       headers: { 'Content-Type': 'application/json' },
     }).catch(() => {});
     clearLegacyAdminSessions();
+    localStorage.removeItem('pe_server_session_hint');
     sessionStorage.removeItem('pe_last_notif_alert');
     sessionStorage.removeItem('pe_last_notif_emp_alert');
     setCurrentUser(null);
@@ -756,10 +774,29 @@ export default function App() {
     notifyDataSaved();
   };
 
-  const handleBulkUpdateEvaluations = (updatedEvals: Evaluation[]) => {
+  const handleImportEmployees = async (
+    updatedList: Employee[],
+    sourceImport: import('./utils/sourceImports').MasterDataSourceImportContext,
+  ): Promise<boolean> => {
+    const accepted = await db.saveEmployeesWithSourceImport(updatedList, sourceImport);
+    if (!accepted) return false;
+    setEmployees(db.getEmployees());
+    notifyDataSaved();
+    return true;
+  };
+
+  const handleBulkUpdateEvaluations = async (updatedEvals: Evaluation[], sourceImport?: import('./utils/sourceImports').ProtectedSourceImportContext): Promise<boolean> => {
+    if (sourceImport) {
+      const accepted = await db.saveEvaluationsWithSourceImport(updatedEvals, sourceImport);
+      if (!accepted) return false;
+      setEvaluations(db.getEvaluations());
+      notifyDataSaved();
+      return true;
+    }
     db.saveEvaluations(updatedEvals);
     setEvaluations(updatedEvals);
     notifyDataSaved();
+    return true;
   };
 
   const handleSetProfiles = (updatedProfiles: JobProfile[]) => {
@@ -823,12 +860,23 @@ export default function App() {
 
   const handleBatchAddCriteria = (
     newOrUpdatedList: Array<Omit<Criterion, 'id'> & { id?: string }>,
-    mode: 'merge' | 'prefix_dept' | 'skip_existing' | 'replace' = 'merge'
-  ) => {
+    mode: 'merge' | 'prefix_dept' | 'skip_existing' | 'replace' = 'merge',
+    sourceImport?: import('./utils/sourceImports').MasterDataSourceImportContext,
+  ): Promise<boolean> | boolean => {
     const batchMode = mode === 'replace' ? 'replace' : mode === 'skip_existing' ? 'skip_existing' : 'merge';
-    db.saveCriteriaBatch(newOrUpdatedList, batchMode);
+    const prepared = db.prepareCriteriaBatch(newOrUpdatedList, batchMode);
+    if (sourceImport) {
+      return db.saveCriteriaWithSourceImport(prepared.criteria, sourceImport).then(accepted => {
+        if (!accepted) return false;
+        setCriteria(db.getCriteria());
+        notifyDataSaved();
+        return true;
+      });
+    }
+    db.saveCriteria(prepared.criteria);
     setCriteria(db.getCriteria());
     notifyDataSaved();
+    return true;
   };
 
   const handleDeleteEvaluation = (id: string) => {
@@ -1126,6 +1174,7 @@ export default function App() {
               profiles={profiles}
               evaluations={evaluations}
               onUpdateEvaluations={handleBulkUpdateEvaluations}
+              currentUser={currentUser}
               theme={theme} 
             />
           )}
@@ -1143,7 +1192,7 @@ export default function App() {
               currentUser={currentUser}
             />
           )}
-          {currentTab === 'employees' && <Employees employees={employees} profiles={profiles} evaluations={evaluations} onAddEmployee={handleAddEmployee} onUpdateEmployee={handleUpdateEmployee} onBulkUpdateEmployees={handleBulkUpdateEmployees} onDeleteEmployee={handleDeleteEmployee} onBulkDeleteEmployees={handleBulkDeleteEmployees} onStartEvaluation={handleStartEvaluationDirect} theme={theme} />}
+          {currentTab === 'employees' && <Employees employees={employees} profiles={profiles} evaluations={evaluations} currentUser={currentUser} onAddEmployee={handleAddEmployee} onUpdateEmployee={handleUpdateEmployee} onBulkUpdateEmployees={handleBulkUpdateEmployees} onImportEmployees={handleImportEmployees} onDeleteEmployee={handleDeleteEmployee} onBulkDeleteEmployees={handleBulkDeleteEmployees} onStartEvaluation={handleStartEvaluationDirect} theme={theme} />}
           {currentTab === 'evaluations' && <Evaluations evaluations={evaluations} employees={employees} profiles={profiles} criteria={criteria} onAddEvaluation={handleAddEvaluation} onActivateEvaluationPeriod={handleActivateEvaluationPeriod} onBulkStartEvaluations={handleBulkStartEvaluations} onUpdateEvaluation={handleUpdateEvaluation} onBulkUpdateEvaluations={handleBulkUpdateEvaluations} onDeleteEvaluation={handleDeleteEvaluation} onBulkDeleteEvaluations={handleBulkDeleteEvaluations} activeEvalId={activeEvalId} onSetActiveEval={setActiveEvalId} onNavigateToWorkflow={() => setCurrentTab('workflow')} currentUser={currentUser} />}
           {currentTab === 'calibration' && <Calibration evaluations={evaluations} employees={employees} profiles={profiles} onUpdateEvaluation={handleUpdateEvaluation} onSelectEvaluation={handleSelectEvaluation} />}
           {currentTab === 'support' && <SupportTickets currentUser={currentUser} theme={theme} />}

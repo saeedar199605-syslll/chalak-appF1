@@ -1,8 +1,9 @@
 import React, { useMemo, useState } from 'react';
-import { AlertTriangle, CheckCircle2, X } from 'lucide-react';
+import { AlertTriangle, CheckCircle2, Search, X } from 'lucide-react';
 import type { Criterion, Employee, Evaluation, JobProfile } from '../types';
 import { manualScoreRange } from '../utils/criterionScoring';
 import { isSupervisorScorableScore, prepareBulkScorePlan, type ScoreAssignments } from '../utils/bulkScoring';
+import { matchesEmployeeSearch } from '../utils/personnelSearch';
 
 interface BulkScoringModalProps {
   evaluationIds: string[];
@@ -22,13 +23,19 @@ export default function BulkScoringModal(props: BulkScoringModalProps) {
   const [criterionId, setCriterionId] = useState('');
   const [scoreValue, setScoreValue] = useState('');
   const [comment, setComment] = useState('');
+  const [searchTerm, setSearchTerm] = useState('');
   const [matrixValues, setMatrixValues] = useState<Record<string, Record<string, number>>>({});
   const [step, setStep] = useState<'edit' | 'preview'>('edit');
   const [operationId] = useState(() => typeof crypto !== 'undefined' && 'randomUUID' in crypto ? crypto.randomUUID() : `bulk-${Date.now()}`);
 
-  const selectedEvaluations = useMemo(() => uniqueIds.map(id => evaluations.find(item => item.id === id)).filter((item): item is Evaluation => Boolean(item)), [uniqueIds, evaluations]);
+  const evaluationById = useMemo(() => new Map(evaluations.map(evaluation => [evaluation.id, evaluation])), [evaluations]);
+  const selectedEvaluations = useMemo(() => uniqueIds.map(id => evaluationById.get(id)).filter((item): item is Evaluation => Boolean(item)), [uniqueIds, evaluationById]);
   const employeeById = useMemo(() => new Map(employees.map(employee => [employee.id, employee])), [employees]);
   const profileById = useMemo(() => new Map(profiles.map(profile => [profile.id, profile])), [profiles]);
+  const visibleSelectedEvaluations = useMemo(() => selectedEvaluations.filter(evaluation => {
+    const employee = employeeById.get(evaluation.empId);
+    return Boolean(employee && matchesEmployeeSearch(employee, searchTerm, [evaluation.period, evaluation.stage || evaluation.status]));
+  }), [selectedEvaluations, employeeById, searchTerm]);
   const candidateCriteria = useMemo(() => criteria.filter(criterion => selectedEvaluations.some(evaluation => {
     const profile = profileById.get(evaluation.profileId);
     const score = evaluation.scores.find(item => item.cid === criterion.id);
@@ -90,6 +97,12 @@ export default function BulkScoringModal(props: BulkScoringModalProps) {
           <span className="mr-auto rounded-xl bg-slate-950 px-3 py-2 text-[10px] text-slate-400">ثبت همه تغییرات با یک ذخیره گروهی انجام می‌شود.</span>
         </div>
 
+        <div className="flex items-center gap-2 border-b border-slate-800 px-5 py-3">
+          <Search className="h-4 w-4 text-slate-500" />
+          <input aria-label="جستجوی کارکنان امتیازدهی گروهی" value={searchTerm} onChange={event => setSearchTerm(event.target.value)} placeholder="جستجو با نام یا کد پرسنلی" className="w-full rounded-xl border border-slate-700 bg-slate-950 p-2 text-xs" />
+          <span className="shrink-0 text-[10px] text-slate-500">{visibleSelectedEvaluations.length} از {selectedEvaluations.length}</span>
+        </div>
+
         {step === 'edit' ? (
           <div className="min-h-0 flex-1 space-y-4 overflow-auto p-5">
             {mode === 'same' ? (
@@ -110,14 +123,19 @@ export default function BulkScoringModal(props: BulkScoringModalProps) {
                   <input value={comment} onChange={event => setComment(event.target.value)} className="mt-1 w-full rounded-xl border border-slate-700 bg-slate-950 p-2.5 text-xs" />
                 </label>
               </div>
-            ) : uniqueIds.length > 100 ? (
+            ) : null}
+            {mode === 'same' && searchTerm.trim() && <div className="flex flex-wrap gap-2 rounded-xl border border-slate-800 bg-slate-950/70 p-3 text-[10px] text-slate-300" aria-label="نتایج کارکنان انتخاب‌شده">
+              {visibleSelectedEvaluations.map(evaluation => { const employee = employeeById.get(evaluation.empId); return <span key={evaluation.id} className="rounded-lg bg-slate-800 px-2 py-1">{employee?.name} · {employee?.code}</span>; })}
+              {!visibleSelectedEvaluations.length && <span className="text-slate-500">موردی پیدا نشد.</span>}
+            </div>}
+            {mode === 'matrix' && uniqueIds.length > 100 ? (
               <div className="rounded-2xl border border-amber-500/30 bg-amber-500/10 p-4 text-xs text-amber-200">برای جلوگیری از کندشدن جدول، حالت جدولی تا ۱۰۰ پرونده را می‌پذیرد. برای گروه‌های بزرگ از «یک نمره برای همه» استفاده کنید.</div>
-            ) : (
+            ) : mode === 'matrix' ? (
               <div className="max-h-[62vh] overflow-auto rounded-2xl border border-slate-800">
                 <table className="min-w-full border-collapse text-right text-[11px]">
                   <thead className="sticky top-0 bg-slate-950 text-slate-300"><tr><th className="min-w-52 p-2">کارمند</th>{matrixCriteria.map(criterion => <th key={criterion.id} className="min-w-28 p-2">{criterion.name}</th>)}</tr></thead>
                   <tbody>
-                    {selectedEvaluations.map(evaluation => {
+                    {visibleSelectedEvaluations.map(evaluation => {
                       const employee = employeeById.get(evaluation.empId);
                       const profile = profileById.get(evaluation.profileId);
                       return <tr key={evaluation.id} className="border-t border-slate-800">
@@ -138,7 +156,7 @@ export default function BulkScoringModal(props: BulkScoringModalProps) {
                   </tbody>
                 </table>
               </div>
-            )}
+            ) : null}
             {mode === 'matrix' && <label className="block max-w-2xl text-xs font-semibold">شاهد مشترک برای نمره‌های واردشده (اختیاری)<input value={comment} onChange={event => setComment(event.target.value)} className="mt-1 w-full rounded-xl border border-slate-700 bg-slate-950 p-2.5 text-xs" /></label>}
             <div className="flex items-center gap-2 rounded-xl border border-slate-800 bg-slate-950/70 p-3 text-[11px] text-slate-400"><AlertTriangle className="h-4 w-4 shrink-0 text-amber-400" /> معیارهای MIS، کسری و سیستمی در جدول غیرفعال‌اند و API نیز تغییر مستقیم آن‌ها را رد می‌کند.</div>
           </div>

@@ -61,6 +61,7 @@ import { previewEvaluationStart } from '../utils/evaluationStart';
 import { authorize, canAccessWorkflowStage, isWithinWorkflowCeiling } from '../utils/authorization';
 import { canPerformWorkflowAction } from '../utils/workflowAuthorization';
 import { isManualScoreInRange } from '../utils/criterionScoring';
+import { employeeSearchScore, matchesEmployeeSearch, normalizeSearchText } from '../utils/personnelSearch';
 import BulkScoringModal from './BulkScoringModal';
 
 const generateLocalCoachingFeedback = (
@@ -126,7 +127,7 @@ interface EvaluationsProps {
   onBulkStartEvaluations?: (employeeIds: string[], period: string) => boolean;
   onActivateEvaluationPeriod?: (period: string) => boolean;
   onUpdateEvaluation: (id: string, ev: Evaluation) => void;
-  onBulkUpdateEvaluations?: (evals: Evaluation[]) => void;
+  onBulkUpdateEvaluations?: (evals: Evaluation[], sourceImport?: import('../utils/sourceImports').ProtectedSourceImportContext) => boolean | Promise<boolean> | void;
   onDeleteEvaluation: (id: string) => void;
   onBulkDeleteEvaluations?: (ids: string[]) => void;
   onNavigateToWorkflow?: () => void;
@@ -169,11 +170,8 @@ export default function Evaluations({
   // Determine admin privileges
   const isAdmin = currentUser?.role === 'admin' || currentUser?.username === 'admin' || currentUser?.code === 'ADMIN-001';
   const filteredStartEmployees = useMemo(() => {
-    const query = startSearch.trim().toLocaleLowerCase();
-    return employees.filter(employee =>
-      (!startUnit || employee.unit === startUnit) &&
-      (!query || `${employee.name} ${employee.code}`.toLocaleLowerCase().includes(query))
-    );
+    const filtered = employees.filter(employee => (!startUnit || employee.unit === startUnit) && matchesEmployeeSearch(employee, startSearch));
+    return startSearch.trim() ? filtered.sort((left, right) => employeeSearchScore(right, startSearch) - employeeSearchScore(left, startSearch)) : filtered;
   }, [employees, startSearch, startUnit]);
 
   const handleActivatePeriod = () => {
@@ -620,19 +618,22 @@ export default function Evaluations({
   };
 
   // Filtered evaluations for virtualized table
-  const filteredEvaluations = evaluations.filter(ev => {
-    const emp = employees.find(e => e.id === ev.empId);
-    const prof = profiles.find(p => p.id === ev.profileId);
-    const q = searchTerm.toLowerCase();
-    return (
-      (emp?.name || '').toLowerCase().includes(q) ||
-      (emp?.code || '').toLowerCase().includes(q) ||
-      (emp?.unit || '').toLowerCase().includes(q) ||
-      (prof?.title || '').toLowerCase().includes(q) ||
-      (ev.period || '').toLowerCase().includes(q) ||
-      (ev.status || '').toLowerCase().includes(q)
-    );
-  });
+  const employeeById = useMemo(() => new Map(employees.map(employee => [employee.id, employee])), [employees]);
+  const profileById = useMemo(() => new Map(profiles.map(profile => [profile.id, profile])), [profiles]);
+  const filteredEvaluations = useMemo(() => {
+    const filtered = evaluations.filter(evaluation => {
+      const employee = employeeById.get(evaluation.empId);
+      if (!employee) return normalizeSearchText(`${evaluation.period} ${evaluation.status}`).includes(normalizeSearchText(searchTerm));
+      const profile = profileById.get(evaluation.profileId);
+      return matchesEmployeeSearch(employee, searchTerm, [profile?.title || '', evaluation.period, evaluation.status]);
+    });
+    if (!searchTerm.trim()) return filtered;
+    return filtered.sort((left, right) => {
+      const leftEmployee = employeeById.get(left.empId);
+      const rightEmployee = employeeById.get(right.empId);
+      return (rightEmployee ? employeeSearchScore(rightEmployee, searchTerm) : 0) - (leftEmployee ? employeeSearchScore(leftEmployee, searchTerm) : 0);
+    });
+  }, [evaluations, employeeById, profileById, searchTerm]);
 
   return (
     <div className="space-y-7 text-right" dir="rtl">
@@ -1591,12 +1592,11 @@ export default function Evaluations({
         criteria={criteria}
         evaluations={evaluations}
         currentUser={currentUser}
-        onUpdateEvaluations={(updatedEvals) => {
-          if (onBulkUpdateEvaluations) {
-            onBulkUpdateEvaluations(updatedEvals);
-          } else {
-            db.saveEvaluations(updatedEvals);
-          }
+        onUpdateEvaluations={(updatedEvals, sourceImport) => {
+          if (onBulkUpdateEvaluations) return onBulkUpdateEvaluations(updatedEvals, sourceImport);
+          if (sourceImport) return db.saveEvaluationsWithSourceImport(updatedEvals, sourceImport);
+          db.saveEvaluations(updatedEvals);
+          return true;
         }}
         onAddEvaluation={onAddEvaluation}
       />
