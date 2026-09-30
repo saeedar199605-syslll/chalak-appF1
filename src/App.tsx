@@ -4,6 +4,8 @@
  */
 import React, { lazy, Suspense, useState, useEffect, useCallback, useRef } from 'react';
 import Sidebar from './components/Sidebar';
+import { navigationLocation } from './utils/navigation';
+const ExcelIntegrationCenter = lazy(() => import('./components/ExcelIntegrationCenter'));
 import Login from './components/Login';
 import SupervisorNotificationBell from './components/SupervisorNotificationBell';
 import { IconButton } from './components/ui/Primitives';
@@ -973,7 +975,7 @@ export default function App() {
     if (currentUser && !canAccessTab(currentUser, currentTab)) {
       setCurrentTab(defaultTabFor(currentUser));
     }
-  }, [currentUser, currentTab]);
+  }, [currentUser, currentTab, cloudDataVersion]);
 
   useEffect(() => {
     if (sessionChecked && currentUser && canAccessTab(currentUser, currentTab)) {
@@ -1001,7 +1003,7 @@ export default function App() {
           <IconButton onClick={() => setIsMobileMenuOpen(true)} className="border-transparent bg-transparent text-teal-500 hover:bg-slate-800/50" label="منو">
             <Menu className="w-5 h-5" />
           </IconButton>
-          <span className="text-xs font-black tracking-tight">{getTabTitle(currentTab)}</span>
+          <span className="text-xs font-black tracking-tight">{navigationLocation(currentTab).title || getTabTitle(currentTab)}</span>
         </div>
         <div className="flex items-center gap-2">
           <IconButton
@@ -1062,9 +1064,9 @@ export default function App() {
           theme === 'dark' ? 'bg-slate-950/90 border-slate-800/80' : 'bg-white/90 border-slate-200/80 shadow-sm'
         }`}>
           <div className="flex min-w-0 flex-wrap items-center gap-3">
-            <span className="text-sm font-extrabold tracking-tight">{getTabTitle(currentTab)}</span>
+            <span className="text-sm font-extrabold tracking-tight">{navigationLocation(currentTab).title || getTabTitle(currentTab)}</span>
             <span className="hidden xl:inline h-4 w-px bg-slate-200 dark:bg-slate-800" aria-hidden="true" />
-            <span className="hidden xl:inline text-xs text-slate-500 font-medium">سامانه جامع مدیریت عملکرد و ارزیابی شایستگی‌های شغلی</span>
+            <span aria-label="موقعیت صفحه" className="text-xs text-slate-500 font-medium">{navigationLocation(currentTab).group} / {navigationLocation(currentTab).title}</span>
           </div>
           <div className="flex min-w-0 flex-wrap items-center justify-end gap-3">
             <button
@@ -1141,7 +1143,7 @@ export default function App() {
 
         <div className="app-content px-4 py-5 sm:px-6 sm:py-6 xl:px-8 xl:py-8">
           <div className="app-page mx-auto max-w-[88rem] space-y-7">
-          <Suspense key={cloudDataVersion} fallback={<div className="p-8 text-center text-sm text-slate-400">در حال بارگذاری بخش…</div>}>
+          <Suspense key={currentUser.id} fallback={<div className="p-8 text-center text-sm text-slate-400">در حال بارگذاری بخش…</div>}>
           {currentTab === 'dashboard' && <Dashboard criteria={criteria} profiles={profiles} employees={employees} evaluations={evaluations} onNavigate={setCurrentTab} onSelectEvaluation={handleSelectEvaluation} currentUser={currentUser} hasCertifiedBadge={hasCertifiedBadge} theme={theme} />}
           {currentTab === 'workflow' && (
             <WorkflowManager 
@@ -1194,6 +1196,7 @@ export default function App() {
           )}
           {currentTab === 'employees' && <Employees employees={employees} profiles={profiles} evaluations={evaluations} currentUser={currentUser} onAddEmployee={handleAddEmployee} onUpdateEmployee={handleUpdateEmployee} onBulkUpdateEmployees={handleBulkUpdateEmployees} onImportEmployees={handleImportEmployees} onDeleteEmployee={handleDeleteEmployee} onBulkDeleteEmployees={handleBulkDeleteEmployees} onStartEvaluation={handleStartEvaluationDirect} theme={theme} />}
           {currentTab === 'evaluations' && <Evaluations evaluations={evaluations} employees={employees} profiles={profiles} criteria={criteria} onAddEvaluation={handleAddEvaluation} onActivateEvaluationPeriod={handleActivateEvaluationPeriod} onBulkStartEvaluations={handleBulkStartEvaluations} onUpdateEvaluation={handleUpdateEvaluation} onBulkUpdateEvaluations={handleBulkUpdateEvaluations} onDeleteEvaluation={handleDeleteEvaluation} onBulkDeleteEvaluations={handleBulkDeleteEvaluations} activeEvalId={activeEvalId} onSetActiveEval={setActiveEvalId} onNavigateToWorkflow={() => setCurrentTab('workflow')} currentUser={currentUser} />}
+          {currentTab === 'imports' && <ExcelIntegrationCenter embedded isOpen onClose={() => setCurrentTab('dashboard')} employees={employees} profiles={profiles} criteria={criteria} evaluations={evaluations} currentUser={currentUser} onUpdateEvaluations={handleBulkUpdateEvaluations} onAddEvaluation={handleAddEvaluation} />}
           {currentTab === 'calibration' && <Calibration evaluations={evaluations} employees={employees} profiles={profiles} onUpdateEvaluation={handleUpdateEvaluation} onSelectEvaluation={handleSelectEvaluation} />}
           {currentTab === 'support' && <SupportTickets currentUser={currentUser} theme={theme} />}
           {currentTab === 'reports' && (

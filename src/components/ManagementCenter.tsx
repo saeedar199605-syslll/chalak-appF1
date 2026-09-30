@@ -1,3 +1,4 @@
+import SearchInput from './ui/SearchInput';
 /**
  * @license
  * SPDX-License-Identifier: Apache-2.0
@@ -129,6 +130,10 @@ export default function ManagementCenter({
 }: ManagementCenterProps) {
   // Navigation Tab inside Management Center
   const [activeSectionTab, setActiveSectionTab] = useState<'security' | 'rbac' | 'backup' | 'history' | 'logs' | 'all'>('security');
+  const changeSection = (section: typeof activeSectionTab) => {
+    if (section !== activeSectionTab && !window.dispatchEvent(new CustomEvent('pe_navigation_request', { cancelable: true }))) return;
+    setActiveSectionTab(section);
+  };
 
   // Internal fallback state for archived evaluations if not passed directly
   const [internalArchivedEvaluations, setInternalArchivedEvaluations] = useState<Evaluation[]>(() => {
@@ -1754,7 +1759,7 @@ export default function ManagementCenter({
       <div className="flex flex-wrap items-center gap-2 pb-3 border-b border-slate-200 dark:border-slate-800">
         <button
           type="button"
-          onClick={() => setActiveSectionTab('security')}
+          onClick={() => changeSection('security')}
           className={`py-2.5 px-4 rounded-2xl text-xs font-black transition-all flex items-center gap-2 cursor-pointer shrink-0 ${
             activeSectionTab === 'security'
               ? 'bg-rose-500 text-slate-50 shadow-lg shadow-rose-500/20'
@@ -1768,7 +1773,7 @@ export default function ManagementCenter({
 
         <button
           type="button"
-          onClick={() => setActiveSectionTab('rbac')}
+          onClick={() => changeSection('rbac')}
           className={`py-2.5 px-4 rounded-2xl text-xs font-black transition-all flex items-center gap-2 cursor-pointer shrink-0 ${
             activeSectionTab === 'rbac'
               ? 'bg-teal-500 text-slate-950 shadow-lg shadow-teal-500/20'
@@ -1776,12 +1781,12 @@ export default function ManagementCenter({
           }`}
         >
           <FolderLock className="w-4 h-4" />
-          <span>دسترسی‌ها و ماتریس سازمانی (RBAC)</span>
+          <span>دسترسی کاربران</span>
         </button>
 
         <button
           type="button"
-          onClick={() => setActiveSectionTab('backup')}
+          onClick={() => changeSection('backup')}
           className={`py-2.5 px-4 rounded-2xl text-xs font-black transition-all flex items-center gap-2 cursor-pointer shrink-0 ${
             activeSectionTab === 'backup'
               ? 'bg-indigo-500 text-slate-50 shadow-lg shadow-indigo-500/20'
@@ -1794,7 +1799,7 @@ export default function ManagementCenter({
 
         <button
           type="button"
-          onClick={() => setActiveSectionTab('history')}
+          onClick={() => changeSection('history')}
           className={`py-2.5 px-4 rounded-2xl text-xs font-black transition-all flex items-center gap-2 cursor-pointer shrink-0 ${
             activeSectionTab === 'history'
               ? 'bg-purple-600 text-white shadow-lg shadow-purple-600/20'
@@ -1808,7 +1813,7 @@ export default function ManagementCenter({
 
         <button
           type="button"
-          onClick={() => setActiveSectionTab('logs')}
+          onClick={() => changeSection('logs')}
           className={`py-2.5 px-4 rounded-2xl text-xs font-black transition-all flex items-center gap-2 cursor-pointer shrink-0 ${
             activeSectionTab === 'logs'
               ? 'bg-amber-500 text-slate-950 shadow-lg shadow-amber-500/20'
@@ -1822,7 +1827,7 @@ export default function ManagementCenter({
 
         <button
           type="button"
-          onClick={() => setActiveSectionTab('all')}
+          onClick={() => changeSection('all')}
           className={`py-2.5 px-3 rounded-2xl text-xs font-bold transition-all flex items-center gap-1.5 cursor-pointer shrink-0 ml-auto ${
             activeSectionTab === 'all'
               ? 'bg-slate-700 text-slate-100'
@@ -2075,7 +2080,7 @@ export default function ManagementCenter({
             {/* Search and Filters Bar */}
             <div className="grid grid-cols-1 sm:grid-cols-12 gap-3 bg-slate-900/60 p-4 rounded-2xl border border-slate-800">
               <div className="sm:col-span-5 relative">
-                <input
+                <SearchInput
                   type="text"
                   placeholder="جستجو بر اساس نام همکار، کد پرسنلی، نام کاربری یا واحد..."
                   value={userSearchTerm}
@@ -2086,7 +2091,7 @@ export default function ManagementCenter({
               </div>
 
               <div className="sm:col-span-3">
-                <input aria-label="جستجوی کاربر بر اساس کد پرسنلی" value={individualSearchTerm} onChange={event => setIndividualSearchTerm(event.target.value)} placeholder="جستجو با نام یا کد پرسنلی" className="w-full rounded-xl border border-slate-700 bg-slate-950 px-2.5 py-2 text-xs text-slate-200" />
+                <SearchInput aria-label="جستجوی کاربر بر اساس کد پرسنلی" value={individualSearchTerm} onChange={event => setIndividualSearchTerm(event.target.value)} placeholder="جستجو با نام یا کد پرسنلی" className="w-full rounded-xl border border-slate-700 bg-slate-950 px-2.5 py-2 text-xs text-slate-200" />
                 <select
                   value={userRoleFilter}
                   onChange={(e) => setUserRoleFilter(e.target.value as any)}
@@ -2463,6 +2468,7 @@ export default function ManagementCenter({
         <div className="space-y-6">
           <GranularPermissionEditor employees={employees} />
           
+          <details className="rounded-2xl border border-slate-700 p-4"><summary className="cursor-pointer text-sm font-bold">تنظیمات تکمیلی نقش، حساب و راهنما</summary><p className="my-3 text-sm text-slate-400">مجوزهای عملیاتی در بخش دسترسی کاربران تنظیم می‌شوند. این بخش برای نقش حساب و سیاست‌های قدیمی راهنما است.</p>
           {/* 1. INDIVIDUAL USER ACCESS & PERMISSION OVERRIDES */}
           <div className="bg-slate-800/40 border border-teal-500/30 rounded-3xl p-6 space-y-6 shadow-xl">
             <div className="flex flex-col md:flex-row md:items-center justify-between gap-4 border-b border-slate-800 pb-4">
@@ -3196,6 +3202,7 @@ export default function ManagementCenter({
 
           </div>
 
+          </details>
         </div>
       )}
 

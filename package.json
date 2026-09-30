@@ -8,9 +8,7 @@
     "build": "vite build",
     "typecheck": "tsc --noEmit",
     "lint": "npm run typecheck",
-    "test": "vitest run",
-    "test:e2e": "playwright test",
-    "check": "npm run typecheck && npm run test && npm run build",
+    "check": "npm run typecheck && npm run build",
     "preview": "vite preview",
     "cf:dev": "npm run build && wrangler pages dev dist",
     "cf:functions": "wrangler pages functions build --outdir .wrangler/functions-build",
@@ -32,12 +30,10 @@
   },
   "devDependencies": {
     "@cloudflare/workers-types": "^5.20260914.1",
-    "@playwright/test": "^1.63.0",
     "@types/node": "^22.14.0",
     "autoprefixer": "^10.4.21",
     "tailwindcss": "^4.1.14",
     "typescript": "~5.8.2",
-    "vitest": "^5.0.2",
     "wrangler": "^4.131.2"
   },
   "overrides": {

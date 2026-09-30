@@ -1,9 +1,10 @@
+import SearchInput from './ui/SearchInput';
 /**
  * @license
  * SPDX-License-Identifier: Apache-2.0
  */
 
-import React, { useState } from 'react';
+import React, { memo, useMemo, useState } from 'react';
 import { calculateFinalScore, evaluateNumericFormula } from '../utils/formulaEngine';
 import { createPortal } from 'react-dom';
 import { downloadWorkbook, recordsToRows } from '../utils/excelWorkbook';
@@ -52,6 +53,20 @@ interface ReportsProps {
   currentUser?: Employee | null;
   theme?: 'dark' | 'light';
 }
+
+// Typing only rerenders this small selector, rather than all charts and report rows.
+const ReportsEmployeeFilter = memo(function ReportsEmployeeFilter({ employees, selected, onSelect }: { employees: Employee[]; selected: string; onSelect: (id: string) => void }) {
+  const [query, setQuery] = useState('');
+  const results = useMemo(() => rankEmployeesBySearch(employees, query), [employees, query]);
+  return <div className="flex min-w-0 flex-wrap items-center gap-2">
+    <span className="text-xs text-slate-600 dark:text-slate-400">فیلتر پرسنل:</span>
+    <SearchInput resultCount={results.length} aria-label="جستجوی گزارش بر اساس کد پرسنلی" value={query} onChange={e => setQuery(e.target.value)} placeholder="نام یا کد پرسنلی" />
+    <select aria-label="کارمند گزارش" value={selected} onChange={e => onSelect(e.target.value)} className="min-h-11 max-w-full rounded-xl border border-slate-200 bg-white px-3 text-sm dark:border-slate-700 dark:bg-slate-950">
+      <option value="all">میانگین کل سازمان (اصفهان چالاک)</option>
+      {results.map(e => <option key={e.id} value={e.id}>{e.name} · {e.code} ({e.unit})</option>)}
+    </select>
+  </div>;
+});
 
 export default function Reports({
   evaluations,
@@ -158,8 +173,6 @@ export default function Reports({
   }).filter(c => c.count > 0);
 
   const [selectedEmpForRadar, setSelectedEmpForRadar] = useState<string>('all');
-  const [radarEmployeeQuery, setRadarEmployeeQuery] = useState('');
-  const radarEmployeeResults = rankEmployeesBySearch(employees, radarEmployeeQuery);
 
   const getRadarData = (): CompetencyDimensionData[] => {
     const targetEvals = selectedEmpForRadar === 'all'
@@ -438,20 +451,7 @@ export default function Reports({
             </div>
           </div>
 
-          <div className="flex items-center gap-2">
-            <span className="text-xs text-slate-600 dark:text-slate-400">فیلتر پرسنل:</span>
-            <input aria-label="جستجوی گزارش بر اساس کد پرسنلی" value={radarEmployeeQuery} onChange={event => setRadarEmployeeQuery(event.target.value)} placeholder="نام یا کد پرسنلی" className="w-36 rounded-xl border border-slate-200 bg-white px-2 py-1.5 text-xs dark:border-slate-700 dark:bg-slate-950/70" />
-            <select
-              value={selectedEmpForRadar}
-              onChange={(e) => setSelectedEmpForRadar(e.target.value)}
-              className="text-xs font-bold bg-white dark:bg-slate-950/70 border border-slate-200 dark:border-slate-700 text-teal-800 dark:text-teal-300 px-3 py-1.5 rounded-xl focus:outline-none focus:ring-1 focus:ring-teal-500"
-            >
-              <option value="all">میانگین کل سازمان (اصفهان چالاک)</option>
-              {radarEmployeeResults.map(emp => (
-                <option key={emp.id} value={emp.id}>{emp.name} · {emp.code} ({emp.unit})</option>
-              ))}
-            </select>
-          </div>
+          <ReportsEmployeeFilter employees={employees} selected={selectedEmpForRadar} onSelect={setSelectedEmpForRadar} />
         </div>
 
         <div className="flex flex-col md:flex-row items-center justify-around gap-6 pt-2">

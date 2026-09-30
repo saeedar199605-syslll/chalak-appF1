@@ -1,3 +1,4 @@
+import SearchInput from './ui/SearchInput';
 import React, { useMemo, useState } from 'react';
 import { AlertTriangle, CheckCircle2, Search, X } from 'lucide-react';
 import type { Criterion, Employee, Evaluation, JobProfile } from '../types';
@@ -98,8 +99,7 @@ export default function BulkScoringModal(props: BulkScoringModalProps) {
         </div>
 
         <div className="flex items-center gap-2 border-b border-slate-800 px-5 py-3">
-          <Search className="h-4 w-4 text-slate-500" />
-          <input aria-label="جستجوی کارکنان امتیازدهی گروهی" value={searchTerm} onChange={event => setSearchTerm(event.target.value)} placeholder="جستجو با نام یا کد پرسنلی" className="w-full rounded-xl border border-slate-700 bg-slate-950 p-2 text-xs" />
+          <SearchInput resultCount={visibleSelectedEvaluations.length} aria-label="جستجوی کارکنان امتیازدهی گروهی" value={searchTerm} onChange={event => setSearchTerm(event.target.value)} placeholder="جستجو با نام یا کد پرسنلی" />
           <span className="shrink-0 text-[10px] text-slate-500">{visibleSelectedEvaluations.length} از {selectedEvaluations.length}</span>
         </div>
 

@@ -8,10 +8,12 @@ export default defineConfig(() => {
     base: './',
     plugins: [react(), tailwindcss()],
     resolve: {
+      dedupe: ['react', 'react-dom'],
       alias: {
         '@': path.resolve(__dirname, '.'),
       },
     },
+    optimizeDeps: { entries: ['index.html'] },
     server: {
       host: '0.0.0.0',
       port: 3000,

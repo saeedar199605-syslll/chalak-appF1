@@ -24,6 +24,7 @@ export function matchesPersonnelCode(code: string, query: string): boolean {
 export function normalizeSearchText(value: string): string {
   return normalizeDigits(String(value || '').normalize('NFKC'))
     .toLocaleLowerCase()
+    .replace(/ي/g, 'ی').replace(/ك/g, 'ک')
     .replace(/[\u200c\u200f]/g, ' ')
     .trim()
     .replace(/\s+/g, ' ');
@@ -31,8 +32,11 @@ export function normalizeSearchText(value: string): string {
 
 export function employeeSearchScore(employee: Employee, query: string, extraText: string[] = []): number {
   const normalizedQuery = normalizeSearchText(query);
+  return scoreNormalizedEmployee(employee, normalizedQuery, normalizePersonnelCode(query), extraText);
+}
+
+function scoreNormalizedEmployee(employee: Employee, normalizedQuery: string, codeQuery: string, extraText: string[] = []): number {
   if (!normalizedQuery) return 1;
-  const codeQuery = normalizePersonnelCode(query);
   const code = normalizePersonnelCode(employee.code);
   if (codeQuery && code === codeQuery) return 100;
   if (codeQuery && code.includes(codeQuery)) return 80;
@@ -49,8 +53,9 @@ export function matchesEmployeeSearch(employee: Employee, query: string, extraTe
 /** Stable ordering puts exact personnel-code matches ahead of text matches. */
 export function rankEmployeesBySearch<T extends Employee>(employees: T[], query: string, extraText?: (employee: T) => string[]): T[] {
   if (!query.trim()) return employees;
+  const textQuery = normalizeSearchText(query), codeQuery = normalizePersonnelCode(query);
   return employees
-    .map((employee, index) => ({ employee, index, score: employeeSearchScore(employee, query, extraText?.(employee)) }))
+    .map((employee, index) => ({ employee, index, score: scoreNormalizedEmployee(employee, textQuery, codeQuery, extraText?.(employee)) }))
     .filter(result => result.score > 0)
     .sort((left, right) => right.score - left.score || left.index - right.index)
     .map(result => result.employee);

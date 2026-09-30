@@ -1,3 +1,4 @@
+import SearchInput from './ui/SearchInput';
 /**
  * @license
  * SPDX-License-Identifier: Apache-2.0
@@ -158,6 +159,7 @@ export default function Evaluations({
   const [newEmpId, setNewEmpId] = useState('');
   const [newPeriod, setNewPeriod] = useState('نیمه اول ۱۴۰۵');
   const [activePeriod, setActivePeriod] = useState(() => db.getMiscData<string>('pe_active_period', ''));
+  useEffect(() => db.subscribe((key, value) => { if (key === 'pe_active_period') setActivePeriod(typeof value === 'string' ? value : ''); }), []);
   const [startSelection, setStartSelection] = useState<Set<string>>(new Set<string>());
   const [startSearch, setStartSearch] = useState('');
   const [startUnit, setStartUnit] = useState('');
@@ -692,13 +694,12 @@ export default function Evaluations({
           {/* Search and Filters for Evaluations */}
           <div className="flex items-center justify-between gap-3 bg-white dark:bg-slate-900/70 p-3.5 rounded-2xl border border-slate-200 dark:border-slate-800 flex-wrap shadow-sm shadow-slate-950/[0.025]">
             <div className="relative flex-1 min-w-[240px]">
-              <Search className="w-4 h-4 text-slate-500 absolute right-3 top-1/2 -translate-y-1/2" />
-              <input
+              <SearchInput resultCount={filteredEvaluations.length}
                 type="text"
                 placeholder="جستجو در ارزیابی‌ها (نام، کد پرسنلی، واحد یا دوره)..."
                 value={searchTerm}
                 onChange={(e) => setSearchTerm(e.target.value)}
-                className="w-full min-h-11 bg-slate-50 dark:bg-slate-950/70 border border-slate-200 dark:border-slate-800 rounded-xl pr-9 pl-4 py-2.5 text-sm text-slate-800 dark:text-slate-100 placeholder:text-slate-400 dark:placeholder:text-slate-500 focus:outline-none focus:border-teal-500 focus:ring-4 focus:ring-teal-500/10"
+               
               />
             </div>
             <div className="flex items-center gap-3 text-xs text-slate-400">
@@ -1360,7 +1361,7 @@ export default function Evaluations({
             <form onSubmit={handleCreateEvaluation} className="p-5 space-y-4">
               <div>
                 <label className="block text-xs font-semibold text-slate-400 mb-1.5">انتخاب یک یا چند همکار</label>
-                <input value={startSearch} onChange={event => setStartSearch(event.target.value)} placeholder="جستجو با نام یا کد پرسنلی" className="w-full bg-slate-950 border border-slate-800 rounded-xl py-2 px-3 text-xs text-slate-200 focus:outline-none focus:border-teal-500" />
+                <SearchInput resultCount={filteredStartEmployees.length} value={startSearch} onChange={event => setStartSearch(event.target.value)} placeholder="جستجو با نام یا کد پرسنلی" />
                 <select value={startUnit} onChange={event => setStartUnit(event.target.value)} aria-label="فیلتر واحد سازمانی" className="mt-2 w-full bg-slate-950 border border-slate-800 rounded-xl py-2 px-3 text-xs text-slate-200">
                   <option value="">همه واحدها</option>
                   {Array.from(new Set(employees.map(employee => employee.unit).filter(Boolean))).sort().map(unit => <option key={unit} value={unit}>{unit}</option>)}

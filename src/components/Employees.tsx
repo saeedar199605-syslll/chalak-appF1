@@ -1,3 +1,4 @@
+import SearchInput from './ui/SearchInput';
 /**
  * @license
  * SPDX-License-Identifier: Apache-2.0
@@ -776,13 +777,12 @@ export default function Employees({
       {/* Toolbar Search & View Mode Switcher */}
       <div className="bg-white dark:bg-slate-900/70 border border-slate-200/90 dark:border-slate-800 p-3.5 sm:p-4 rounded-2xl flex flex-col md:flex-row gap-3.5 items-stretch md:items-center justify-between shadow-sm shadow-slate-950/[0.025]">
         <div className="relative w-full md:w-[min(100%,24rem)]">
-          <Search className="w-4 h-4 text-slate-500 absolute right-3.5 top-1/2 -translate-y-1/2" />
-          <input
+          <SearchInput resultCount={filteredEmployees.length}
             type="text"
             placeholder="جستجو در نام، کد پرسنلی، واحد، شایستگی یا نقش..."
             value={searchTerm}
             onChange={(e) => setSearchTerm(e.target.value)}
-            className="w-full bg-slate-50 dark:bg-slate-950/70 border border-slate-200 dark:border-slate-700 rounded-xl py-3 pr-10 pl-3 text-sm text-slate-800 dark:text-slate-100 placeholder:text-slate-400 dark:placeholder:text-slate-500 focus:outline-none focus:border-teal-500 focus:ring-4 focus:ring-teal-500/10"
+           
           />
         </div>
 

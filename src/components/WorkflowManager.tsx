@@ -1,3 +1,4 @@
+import SearchInput from './ui/SearchInput';
 /**
  * @license
  * SPDX-License-Identifier: Apache-2.0
@@ -1661,13 +1662,12 @@ export default function WorkflowManager({
           <div className="sticky top-16 z-20 bg-slate-900/95 backdrop-blur-xl border border-slate-800 p-4 rounded-3xl flex flex-wrap items-center justify-between gap-3 shadow-lg">
             <div className="flex flex-wrap items-center gap-3">
               <div className="relative">
-                <Search className="w-4 h-4 text-slate-400 absolute right-3 top-1/2 -translate-y-1/2" />
-                <input
+                <SearchInput resultCount={allFilteredEvaluations.length}
                   type="text"
                   placeholder="جستجوی همکار، کد، سرپرست یا کارتابل..."
                   value={searchQuery}
                   onChange={e => setSearchQuery(e.target.value)}
-                  className="bg-slate-950 border border-slate-800 text-xs text-slate-200 pr-9 pl-4 py-2 rounded-xl focus:border-teal-500 focus:outline-none w-72"
+                 
                 />
               </div>
 
@@ -2850,7 +2850,7 @@ export default function WorkflowManager({
             {actionType === 'reassign' && (
               <div>
                 <label className="block text-xs font-semibold text-slate-400 mb-1.5">شخص جدید مسئول کارتابل:</label>
-                <input aria-label="جستجوی مسئول جدید با کد پرسنلی" value={personSelectorQuery} onChange={event => setPersonSelectorQuery(event.target.value)} placeholder="جستجو با نام یا کد پرسنلی" className="mb-2 w-full rounded-xl border border-slate-800 bg-slate-950 p-2.5 text-xs text-slate-200" />
+                <SearchInput resultCount={rankEmployeesBySearch(employees, personSelectorQuery, employee => [employee.unit, employee.role]).length} aria-label="جستجوی مسئول جدید با کد پرسنلی" value={personSelectorQuery} onChange={event => setPersonSelectorQuery(event.target.value)} placeholder="جستجو با نام یا کد پرسنلی" />
                 <select
                   value={reassignTargetId}
                   onChange={e => setReassignTargetId(e.target.value)}
@@ -3364,7 +3364,7 @@ export default function WorkflowManager({
             <div className="space-y-3 text-right">
               <div>
                 <label className="block text-xs font-semibold text-slate-400 mb-1.5" htmlFor="delegation-target">کارمند واگذار‌شده‌به:</label>
-                <input aria-label="جستجوی دریافت‌کننده تفویض با کد پرسنلی" value={personSelectorQuery} onChange={event => setPersonSelectorQuery(event.target.value)} placeholder="جستجو با نام یا کد پرسنلی" className="mb-2 w-full rounded-xl border border-slate-800 bg-slate-950 p-2.5 text-xs text-slate-200" />
+                <SearchInput resultCount={rankEmployeesBySearch(employees.filter(e => e.id !== currentUser.id && e.role !== 'admin'), personSelectorQuery, employee => [employee.unit]).length} aria-label="جستجوی دریافت‌کننده تفویض با کد پرسنلی" value={personSelectorQuery} onChange={event => setPersonSelectorQuery(event.target.value)} placeholder="جستجو با نام یا کد پرسنلی" />
                 <select
                   id="delegation-target"
                   value={newDelegationTargetId}
@@ -3417,7 +3417,7 @@ export default function WorkflowManager({
               {newDelegationScope === 'employee' && (
                 <div>
                   <label className="block text-xs font-semibold text-slate-400 mb-1.5" htmlFor="delegation-scope-employee">پرونده کارمند:</label>
-                  <input aria-label="جستجوی پرونده تفویض با کد پرسنلی" value={personSelectorQuery} onChange={event => setPersonSelectorQuery(event.target.value)} placeholder="جستجو با نام یا کد پرسنلی" className="mb-2 w-full rounded-xl border border-slate-800 bg-slate-950 p-2.5 text-xs text-slate-200" />
+                  <SearchInput resultCount={rankEmployeesBySearch(employees.filter(e => currentUser.role === 'admin' || e.supervisorId === currentUser.id || e.id === currentUser.id || (!e.supervisorId && e.unit === currentUser.unit)), personSelectorQuery).length} aria-label="جستجوی پرونده تفویض با کد پرسنلی" value={personSelectorQuery} onChange={event => setPersonSelectorQuery(event.target.value)} placeholder="جستجو با نام یا کد پرسنلی" />
                   <select id="delegation-scope-employee" value={newDelegationEmployeeId} onChange={e => setNewDelegationEmployeeId(e.target.value)} className="w-full bg-slate-950 border border-slate-800 rounded-xl p-2.5 text-xs text-slate-200">
                     <option value="">انتخاب کارمند...</option>
                     {rankEmployeesBySearch(employees.filter(e => currentUser.role === 'admin' || e.supervisorId === currentUser.id || e.id === currentUser.id || (!e.supervisorId && e.unit === currentUser.unit)), personSelectorQuery).map(e => <option key={e.id} value={e.id}>{e.name} · {e.code}</option>)}

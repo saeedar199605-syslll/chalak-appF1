@@ -1,3 +1,4 @@
+import SearchInput from './ui/SearchInput';
 /**
  * @license
  * SPDX-License-Identifier: Apache-2.0
@@ -69,6 +70,7 @@ import { matchesPersonnelCode, normalizePersonnelCode, normalizeSearchText } fro
 
 interface ExcelIntegrationCenterProps {
   isOpen: boolean;
+  embedded?: boolean;
   onClose: () => void;
   employees: Employee[];
   profiles: JobProfile[];
@@ -81,6 +83,7 @@ interface ExcelIntegrationCenterProps {
 
 export default function ExcelIntegrationCenter({
   isOpen,
+  embedded = false,
   onClose,
   employees,
   profiles,
@@ -838,7 +841,7 @@ export default function ExcelIntegrationCenter({
   if (!isOpen) return null;
 
   return (
-    <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-slate-950/80 backdrop-blur-md animate-fade-in" dir="rtl">
+    <div className={embedded ? "w-full" : "fixed inset-0 z-50 flex items-center justify-center p-4 bg-slate-950/80 backdrop-blur-md animate-fade-in"} dir="rtl">
       <div className="bg-slate-900 border border-slate-800 w-full max-w-6xl max-h-[92vh] rounded-3xl shadow-2xl flex flex-col overflow-hidden text-slate-100">
         
         {/* MODAL HEADER */}
@@ -1237,12 +1240,12 @@ export default function ExcelIntegrationCenter({
                   <div className="p-4 border-b border-slate-800 flex flex-col md:flex-row items-center justify-between gap-4">
                     <div className="flex items-center gap-3 w-full md:w-auto">
                       <div className="relative w-full md:w-64">
-                        <input
+                        <SearchInput resultCount={filteredDynamicRecords.length}
                           type="text"
                           placeholder="جستجو در پرسنل یا کد..."
                           value={searchTerm}
                           onChange={(e) => setSearchTerm(e.target.value)}
-                          className="w-full bg-slate-900 border border-slate-700 rounded-xl py-2 pr-9 pl-3 text-xs text-slate-200 focus:outline-none focus:border-teal-500"
+                         
                         />
                         <Search className="w-4 h-4 text-slate-500 absolute right-3 top-1/2 -translate-y-1/2" />
                       </div>
@@ -1713,7 +1716,7 @@ export default function ExcelIntegrationCenter({
                       </button>
                     </div>
 
-                    <label className="flex items-center gap-2 rounded-xl border border-slate-800 bg-slate-950/70 px-3 py-2 text-xs"><Search className="h-4 w-4 text-slate-500" /><input aria-label="جستجوی پیش‌نمایش کسری با کد پرسنلی" value={searchTerm} onChange={event => setSearchTerm(event.target.value)} placeholder="جستجو با نام یا کد پرسنلی" className="w-full bg-transparent outline-none" /></label>
+                    <label className="flex items-center gap-2 rounded-xl border border-slate-800 bg-slate-950/70 px-3 py-2 text-xs"><SearchInput resultCount={filteredKasraPreviewRows.length} aria-label="جستجوی پیش‌نمایش کسری با کد پرسنلی" value={searchTerm} onChange={event => setSearchTerm(event.target.value)} placeholder="جستجو با نام یا کد پرسنلی" /></label>
                     <div className="overflow-x-auto max-h-80 rounded-2xl border border-slate-800">
                       <table className="w-full text-right text-xs">
                         <thead className="bg-slate-900 text-slate-300">
@@ -1832,7 +1835,7 @@ export default function ExcelIntegrationCenter({
                       </button>
                     </div>
 
-                    <label className="flex items-center gap-2 rounded-xl border border-slate-800 bg-slate-950/70 px-3 py-2 text-xs"><Search className="h-4 w-4 text-slate-500" /><input aria-label="جستجوی پیش‌نمایش MIS با کد پرسنلی" value={searchTerm} onChange={event => setSearchTerm(event.target.value)} placeholder="جستجو با نام یا کد پرسنلی" className="w-full bg-transparent outline-none" /></label>
+                    <label className="flex items-center gap-2 rounded-xl border border-slate-800 bg-slate-950/70 px-3 py-2 text-xs"><SearchInput resultCount={filteredMisRecords.length} aria-label="جستجوی پیش‌نمایش MIS با کد پرسنلی" value={searchTerm} onChange={event => setSearchTerm(event.target.value)} placeholder="جستجو با نام یا کد پرسنلی" /></label>
                     <div className="overflow-x-auto max-h-80 rounded-2xl border border-slate-800">
                       <table className="w-full text-right text-xs">
                         <thead className="bg-slate-900 text-slate-300">

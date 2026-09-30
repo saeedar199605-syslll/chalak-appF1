@@ -1,5 +1,5 @@
 import type { Employee } from '../types';
-import { authorize, getEffectivePermissionGrant, readGranularPermissionPolicy, type AuthorizationModule } from './authorization';
+import { authorize, canImport, readGranularPermissionPolicy, type AuthorizationModule } from './authorization';
 
 const COMMON_TABS = new Set(['workflow', 'lattice-hub', 'onboarding', 'support']);
 const ADMIN_TABS = new Set(['dashboard', 'evaluations', 'kickidler-hub', 'criteria', 'profiles', 'employees', 'calibration', 'reports', 'rewards', 'settings']);
@@ -23,6 +23,8 @@ export function defaultTabFor(user: Employee): string {
 }
 
 export function canAccessTab(user: Employee, tab: string, policy = readGranularPermissionPolicy()): boolean {
+  if (tab === 'imports') return canImport(user, 'mis', undefined, policy).allowed || canImport(user, 'kasra', undefined, policy).allowed;
+  if (tab === 'settings' || tab === 'rewards') return user.role === 'admin';
   if (user.role === 'admin') return ADMIN_TABS.has(tab) || COMMON_TABS.has(tab);
   const module = TAB_MODULES[tab];
   if (module && hasExplicitGrant(user, module, policy)) return authorize(user, module, 'view', undefined, policy).allowed;

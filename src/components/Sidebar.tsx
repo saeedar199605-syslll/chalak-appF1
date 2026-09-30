@@ -31,7 +31,7 @@ import { LifeBuoy, LayoutDashboard,
   FileText
 } from 'lucide-react';
 import { Employee, UserRole } from '../types';
-import { canAccessTab } from '../utils/accessControl';
+import { visibleNavigation } from '../utils/navigation';
 
 interface SidebarProps {
   currentTab: string;
@@ -63,39 +63,7 @@ export default function Sidebar({
   onCloseMobile
 }: SidebarProps) {
   
-  // Navigation follows the product lifecycle: prepare → evaluate → review → report.
-  type MenuItem = { id: string, label: string, icon: any, roles?: string[], permission?: string };
-  type MenuGroup = { title: string, items: MenuItem[] };
-  
-  const menuGroups: MenuGroup[] = [
-    { title: '۱. آماده‌سازی سازمان', items: [
-      { id: 'employees', label: 'مدیریت کارکنان', icon: Users, roles: ['admin'] },
-      { id: 'profiles', label: 'پروفایل‌های شغلی', icon: Briefcase, roles: ['admin'] },
-      { id: 'criteria', label: 'بانک شاخص‌ها و فرمول‌های KPI', icon: Calculator, roles: ['admin', 'supervisor'], permission: 'manage_criteria' },
-    ] },
-    { title: '۲. دوره و ارزیابی', items: [
-      { id: 'dashboard', label: 'داشبورد و آمادگی دوره', icon: LayoutDashboard, roles: ['admin', 'supervisor'] },
-      { id: 'evaluations', label: 'ارزیابی‌ها، MIS و دوره‌ها', icon: ClipboardCheck, roles: ['admin', 'supervisor'] },
-      { id: 'my-evaluation', label: 'کارنامه و خودارزیابی من', icon: ShieldCheck, roles: ['employee'] },
-    ] },
-    { title: '۳. گردش کار و بازبینی', items: [
-      { id: 'workflow', label: 'کارتابل و گردش کار', icon: GitFork, roles: ['admin', 'supervisor', 'employee'] },
-      { id: 'calibration', label: 'کالیبراسیون نمرات', icon: Scale, roles: ['admin'] },
-    ] },
-    { title: '۴. نتایج و گزارش', items: [
-      { id: 'reports', label: 'تحلیل‌ها و ماتریس ۹-Box', icon: TrendingUp, roles: ['admin', 'supervisor'], permission: 'view_all_reports' },
-      { id: 'rewards', label: 'محاسبات ریالی پاداش', icon: Award, roles: ['admin'] },
-    ] },
-    { title: '۵. توسعه و پایش مستمر', items: [
-      { id: 'lattice-hub', label: 'اهداف OKR، جلسات ۱به۱ و تمجید', icon: Target, roles: ['admin', 'supervisor', 'employee'] },
-      { id: 'kickidler-hub', label: 'پایش زمان و بهره‌وری کارکرد', icon: Monitor, roles: ['admin', 'supervisor'] },
-    ] },
-    { title: '۶. پشتیبانی و مدیریت سامانه', items: [
-      { id: 'onboarding', label: 'آموزش بدو ورود', icon: BookOpen, roles: ['admin', 'supervisor', 'employee'] },
-      { id: 'support', label: currentUser.role === 'admin' ? 'مدیریت تیکت‌ها' : 'پشتیبانی و ارتباط با مدیر', icon: LifeBuoy, roles: ['admin', 'supervisor', 'employee'] },
-      { id: 'settings', label: 'مرکز مدیریت و امنیت', icon: LockKeyhole, roles: ['admin'] },
-    ] },
-  ];
+  const menuGroups = visibleNavigation(currentUser);
 
   const getRoleLabel = (role: UserRole) => {
     switch (role) {
@@ -106,6 +74,7 @@ export default function Sidebar({
   };
 
   const handleTabClick = (tabId: string) => {
+    if (tabId !== currentTab && !window.dispatchEvent(new CustomEvent('pe_navigation_request', { cancelable: true }))) return;
     onChangeTab(tabId);
     if (onCloseMobile) {
       onCloseMobile();
@@ -173,7 +142,7 @@ export default function Sidebar({
                 <span className="text-xs font-black truncate block">
                   {currentUser.name}
                 </span>
-                <span className="text-[9px] text-slate-400 truncate block">
+                <span className="text-xs text-slate-500 truncate block">
                   {getRoleLabel(currentUser.role)}
                 </span>
               </div>
@@ -186,13 +155,11 @@ export default function Sidebar({
           {/* Navigation Menu */}
           <nav aria-label="ناوبری اصلی" className="flex flex-col gap-4">
             {menuGroups.map((group, gIdx) => {
-              const visibleItems = group.items.filter(item => {
-              return canAccessTab(currentUser, item.id);
-            });
+              const visibleItems = group.items;
               if (visibleItems.length === 0) return null;
 
               return (
-                <div key={gIdx} className="space-y-1.5">
+                <div key={group.id} data-navigation-group={group.id} data-active-group={group.items.some(item => item.id === currentTab) || undefined} className="space-y-1.5">
                   <span className="text-[11px] font-semibold text-slate-500 px-3 py-2 block whitespace-normal break-words">
                     {group.title}
                   </span>
