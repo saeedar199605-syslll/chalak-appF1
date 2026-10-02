@@ -1,14 +1,13 @@
 {
   "name": "chalak-performance",
   "private": true,
-  "version": "2.1.0",
+  "version": "4.0.0",
   "type": "module",
   "scripts": {
     "dev": "vite",
     "build": "vite build",
     "typecheck": "tsc --noEmit",
     "lint": "npm run typecheck",
-    "check": "npm run typecheck && npm run build",
     "preview": "vite preview",
     "cf:dev": "npm run build && wrangler pages dev dist",
     "cf:functions": "wrangler pages functions build --outdir .wrangler/functions-build",

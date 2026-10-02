@@ -6,6 +6,7 @@ import { defineConfig } from 'vite';
 export default defineConfig(() => {
   return {
     base: './',
+    worker: { format: 'es' as const },
     plugins: [react(), tailwindcss()],
     resolve: {
       dedupe: ['react', 'react-dom'],
@@ -20,3 +21,4 @@ export default defineConfig(() => {
     },
   };
 });
+
