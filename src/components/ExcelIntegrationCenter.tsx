@@ -98,6 +98,19 @@ export default function ExcelIntegrationCenter({
   const [successMessage, setSuccessMessage] = useState('');
   const [errorMessage, setErrorMessage] = useState('');
   const [searchTerm, setSearchTerm] = useState('');
+  const [permissionRevision, setPermissionRevision] = useState(0);
+  useEffect(() => {
+    const update = (event: Event) => { if ((event as CustomEvent).detail?.key === 'pe_granular_permissions') setPermissionRevision(value => value + 1); };
+    window.addEventListener('pe_db_updated', update);
+    return () => window.removeEventListener('pe_db_updated', update);
+  }, []);
+  const [previewPage, setPreviewPage] = useState(0);
+  const importSubmitting = useRef(false);
+  const misOperationId = useRef(crypto.randomUUID());
+  const kasraOperationId = useRef(crypto.randomUUID());
+  useEffect(() => setPreviewPage(0), [searchTerm, activeTab]);
+  const PreviewPages = ({ count }: { count: number }) => count > 50 ? <div className="flex items-center gap-4 text-xs text-slate-300" aria-label="صفحات پیش‌نمایش"><button type="button" disabled={previewPage === 0} onClick={() => setPreviewPage(page => page - 1)}>صفحه قبل</button><span>{previewPage + 1} / {Math.ceil(count / 50)} · {count} ردیف</span><button type="button" disabled={(previewPage + 1) * 50 >= count} onClick={() => setPreviewPage(page => page + 1)}>صفحه بعد</button></div> : null;
+
 
   // Admin status
   const isAdmin = currentUser?.role === 'admin' || currentUser?.username === 'admin' || currentUser?.name?.includes('مدیریت');
@@ -152,6 +165,24 @@ export default function ExcelIntegrationCenter({
   const selectedKasraPeriod = periodOptions.find(period => period.id === selectedKasraPeriodId);
   const kasraImportAllowed = Boolean(currentUser && canImport(currentUser, 'kasra', undefined, readGranularPermissionPolicy()).allowed);
   const misImportAllowed = Boolean(currentUser && canImport(currentUser, 'mis', undefined, readGranularPermissionPolicy()).allowed);
+  const misEligibility = useMemo(() => {
+    const people = new Map(employees.map(person => [normalizePersonnelCode(person.code), person]));
+    const records = new Map(evaluations.map(record => [`${record.empId}\u0000${getEvaluationPeriodId(record)}`, record]));
+    const jobs = new Map(profiles.map(profile => [profile.id, profile]));
+    const criteriaMap = new Map(criteria.map(criterion => [criterion.id, criterion]));
+    const policy = readGranularPermissionPolicy();
+    return misRecords.map(record => {
+      const employee = people.get(normalizePersonnelCode(record.empCode));
+      const evaluation = employee && records.get(`${employee.id}\u0000${canonicalEvaluationPeriodId(record.period)}`);
+      const profile = evaluation && jobs.get(evaluation.profileId);
+      const reason = !employee ? 'کارمند ناشناخته' : !currentUser || !canImport(currentUser, 'mis', employee, policy).allowed ? 'خارج از مجوز یا محدوده' : !evaluation ? 'ارزیابی این دوره شروع نشده است' : evaluation.status === 'locked' || evaluation.stage === 'completed' ? 'پرونده نهایی و محافظت‌شده' : !profile?.items.some(item => {
+        const criterion = criteriaMap.get(item.cid);
+        return criterion?.scoringSource === 'mis' && criterion.autoPopulate !== false && evaluation.scores.some(score => score.cid === item.cid);
+      }) ? 'معیار MIS قابل ثبت ندارد' : '';
+      return { record, reason };
+    });
+  }, [misRecords, employees, evaluations, profiles, criteria, currentUser, permissionRevision]);
+  const misEligibleCount = misEligibility.filter(row => !row.reason).length;
   const kasraPreviewRows: KasraPreviewRow[] = useMemo(() => buildKasraPreviewRows({
     records: kasraRecords,
     selectedPeriodId: selectedKasraPeriodId,
@@ -161,7 +192,7 @@ export default function ExcelIntegrationCenter({
     evaluations,
     actor: currentUser,
     policy: readGranularPermissionPolicy(),
-  }), [kasraRecords, selectedKasraPeriodId, employees, profiles, criteria, evaluations, currentUser]);
+  }), [kasraRecords, selectedKasraPeriodId, employees, profiles, criteria, evaluations, currentUser, permissionRevision]);
   const kasraCounts = useMemo(() => countKasraPreview(kasraPreviewRows), [kasraPreviewRows]);
   const filteredKasraPreviewRows = useMemo(() => {
     const query = normalizeSearchText(searchTerm);
@@ -360,13 +391,20 @@ export default function ExcelIntegrationCenter({
   };
 
   // --- 4. APPLY DYNAMIC RECORDS TO EVALUATIONS (LIVE SYNC & VALIDATION LAYER) ---
-  const handleApplyDynamicRecords = () => {
+  const handleApplyDynamicRecords = async () => {
     if (dynamicRecords.length === 0) {
       alert('هیچ داده‌ای برای ثبت موجود نیست.');
       return;
     }
 
+    setIsProcessing(true);
+    await new Promise<void>(resolve => requestAnimationFrame(() => resolve()));
     let updatedEvaluations = [...evaluations];
+    const employeesByCode = new Map(employees.map(employee => [normalizePersonnelCode(employee.code), employee]));
+    const evaluationIndices = new Map(evaluations.map((evaluation, index) => [`${evaluation.empId}\u0000${getEvaluationPeriodId(evaluation)}`, index]));
+    const profilesById = new Map(profiles.map(profile => [profile.id, profile]));
+    const criteriaById = new Map(criteria.flatMap(criterion => [[criterion.id, criterion], [criterion.code, criterion]] as Array<[string, Criterion]>));
+    const permissionPolicy = readGranularPermissionPolicy();
     let updatedEvalsCount = 0;
     let newEvalsCount = 0;
     let slotsPopulated = 0;
@@ -374,6 +412,7 @@ export default function ExcelIntegrationCenter({
 
     dynamicRecords.forEach((rec, idx) => {
       const rowNum = idx + 1;
+
       // 1. Resolve Employee by code, username, or name
       const emp = employees.find(
         e => (rec.empCode && e.code.toUpperCase() === rec.empCode.toUpperCase()) ||
@@ -513,8 +552,7 @@ export default function ExcelIntegrationCenter({
     });
 
     // Multi-layer immediate persistence
-    db.saveEvaluations(updatedEvaluations);
-    onUpdateEvaluations(updatedEvaluations);
+    if ((await onUpdateEvaluations(updatedEvaluations)) !== true) { setErrorMessage('سرور ذخیره گروهی را تأیید نکرد؛ داده‌های پیش‌نمایش حفظ شدند.'); return; }
 
     // Validation Report
     const totalProcessed = newEvalsCount + updatedEvalsCount;
@@ -529,11 +567,7 @@ export default function ExcelIntegrationCenter({
 
     setSuccessMessage(`داده‌ها با موفقیت و به صورت در لحظه اعتبارسنجی و ذخیره شدند (${newEvalsCount} ارزیابی جدید، ${updatedEvalsCount} ارزیابی به‌روزرسانی‌شده، ${slotsPopulated} اسلات نمره تکمیل گردید).`);
 
-    logAudit(
-      'اعمال نمرات اکسل داینامیک بر ارزیابی‌ها',
-      `ثبت موفق ${slotsPopulated} اسلات نمره برای ${totalProcessed} پرسنل در دوره`,
-      'success'
-    );
+    // The accepted bulk commit records its audit on the server in the same POST.
   };
 
   // --- 5. KASRA FILE UPLOAD ---
@@ -555,6 +589,7 @@ export default function ExcelIntegrationCenter({
     setKasraErrors([]);
     setKasraApplySummary(null);
     try {
+      kasraOperationId.current = crypto.randomUUID(); setPreviewPage(0);
       const result = await parseKasraExcelFile(file, employees);
       setKasraRecords(result.records);
       setKasraErrors(result.errors);
@@ -568,6 +603,9 @@ export default function ExcelIntegrationCenter({
   };
 
   const handleApplyKasraRecords = async () => {
+    if (importSubmitting.current) return;
+    importSubmitting.current = true;
+    try {
     if (isKasraApplying || !selectedKasraPeriodId) return;
     const validRows = kasraPreviewRows.filter(row => row.status === 'valid' && row.updatedEvaluation);
     if (!validRows.length) return;
@@ -575,7 +613,7 @@ export default function ExcelIntegrationCenter({
     const updatedEvaluations = evaluations.map(evaluation => updates.get(evaluation.id) || evaluation);
     const sourceImport: ProtectedSourceImportContext = {
       importType: 'KASRA',
-      operationId: typeof crypto !== 'undefined' && 'randomUUID' in crypto ? crypto.randomUUID() : `kasra-${Date.now()}`,
+      operationId: kasraOperationId.current,
       evaluationPeriodId: selectedKasraPeriodId,
     };
     setIsKasraApplying(true);
@@ -611,6 +649,9 @@ export default function ExcelIntegrationCenter({
     } finally {
       setIsKasraApplying(false);
     }
+    } catch (error) { setErrorMessage(error instanceof Error ? error.message : 'ذخیره ابری ناموفق بود؛ پیش‌نمایش حفظ شد.'); }
+    finally { importSubmitting.current = false; setIsProcessing(false); setIsKasraApplying(false); }
+
   };
 
   // --- 6. MIS FILE UPLOAD (LEGACY DIRECT) ---
@@ -633,6 +674,7 @@ export default function ExcelIntegrationCenter({
         setMisCounts({ valid: 0, invalid: 0, duplicate: 0, unknown: 0, missingMapping: 0, warning: 0 });
         return;
       }
+      misOperationId.current = crypto.randomUUID(); setPreviewPage(0);
       const result = await parseMISExcelFile(file, employees, selectedPeriod);
       setMisRecords(result.records);
       setMisErrors(result.errors);
@@ -648,6 +690,9 @@ export default function ExcelIntegrationCenter({
   };
 
   const handleApplyMISRecords = async () => {
+    if (importSubmitting.current) return;
+    importSubmitting.current = true;
+    try {
     if (misRecords.length === 0 || !currentUser || !misImportAllowed) return;
     const currentlyActivePeriod = db.getMiscData<string>('pe_active_period', '').trim();
     if (!currentlyActivePeriod || misRecords.some(record => record.period !== currentlyActivePeriod)) {
@@ -658,36 +703,43 @@ export default function ExcelIntegrationCenter({
     }
     const selectedPeriodId = canonicalEvaluationPeriodId(currentlyActivePeriod);
 
+    setIsProcessing(true);
+    await new Promise<void>(resolve => requestAnimationFrame(() => resolve()));
     let updatedEvaluations = [...evaluations];
+    const employeesByCode = new Map(employees.map(employee => [normalizePersonnelCode(employee.code), employee]));
+    const evaluationIndices = new Map(evaluations.map((evaluation, index) => [`${evaluation.empId}\u0000${getEvaluationPeriodId(evaluation)}`, index]));
+    const profilesById = new Map(profiles.map(profile => [profile.id, profile]));
+    const criteriaById = new Map(criteria.flatMap(criterion => [[criterion.id, criterion], [criterion.code, criterion]] as Array<[string, Criterion]>));
+    const permissionPolicy = readGranularPermissionPolicy();
     let updatedEvalsCount = 0;
     let newEvalsCount = 0;
     let slotsPopulated = 0;
     const warnings: string[] = [];
 
-    misRecords.forEach((rec, idx) => {
+    misEligibility.forEach(({ record: rec, reason }, idx) => {
       const rowNum = idx + 1;
-      const emp = employees.find(e => rec.empCode && normalizePersonnelCode(e.code) === normalizePersonnelCode(rec.empCode));
+      if (reason) { warnings.push(`ردیف ${rowNum}: ${reason}`); return; }
+      const emp = employeesByCode.get(normalizePersonnelCode(rec.empCode));
 
       if (!emp) {
         warnings.push(`ردیف ${rowNum}: پرسنل با کد «${rec.empCode || 'نامشخص'}» و نام «${rec.empName || 'نامشخص'}» یافت نشد.`);
         return;
       }
 
-      if (!canImport(currentUser, 'mis', emp, readGranularPermissionPolicy()).allowed) {
+      if (!canImport(currentUser, 'mis', emp, permissionPolicy).allowed) {
         warnings.push(`ردیف ${rowNum}: مجوز MIS برای محدوده این کارمند وجود ندارد.`);
         return;
       }
 
       const evalPeriod = rec.period;
-      let targetIndex = updatedEvaluations.findIndex(
-        ev => ev.empId === emp.id && getEvaluationPeriodId(ev) === selectedPeriodId
-      );
+      const targetIndex = evaluationIndices.get(`${emp.id}\u0000${selectedPeriodId}`) ?? -1;
       if (targetIndex === -1) {
         warnings.push(`ردیف ${rowNum} (${emp.name}): ارزیابی دوره ${evalPeriod} شروع نشده است؛ ابتدا از عملیات شروع دوره، پرونده واجد شرایط را ایجاد کنید.`);
         return;
       }
       const targetEval = updatedEvaluations[targetIndex];
-      const prof = profiles.find(p => p.id === targetEval.profileId);
+      if (targetEval.status === 'locked' || targetEval.stage === 'completed') { warnings.push(`ردیف ${rowNum}: پرونده نهایی محافظت شد.`); return; }
+      const prof = profilesById.get(targetEval.profileId);
       if (!prof?.items?.length) {
         warnings.push(`ردیف ${rowNum} (${emp.name}): پروفایل ارزیابی موجود شاخصی ندارد یا پیدا نشد.`);
         return;
@@ -754,7 +806,7 @@ export default function ExcelIntegrationCenter({
       {
         const profileCriterionIds = new Set(prof.items.map(item => item.cid));
         const updatedScores = targetEval.scores.map(existingScore => {
-          const criterion = criteria.find(item => item.id === existingScore.cid || item.code === existingScore.cid);
+          const criterion = criteriaById.get(existingScore.cid);
           if (!profileCriterionIds.has(existingScore.cid) || criterion?.scoringSource !== 'mis' || criterion.autoPopulate === false) return existingScore;
           const computed = computeScoreForMisCriterion(criterion);
           slotsPopulated++;
@@ -786,7 +838,7 @@ export default function ExcelIntegrationCenter({
     setIsProcessing(true);
     const sourceImport: ProtectedSourceImportContext = {
       importType: 'MIS',
-      operationId: typeof crypto !== 'undefined' && 'randomUUID' in crypto ? crypto.randomUUID() : `mis-${Date.now()}`,
+      operationId: misOperationId.current,
       evaluationPeriodId: selectedPeriodId,
     };
     const accepted = await onUpdateEvaluations(updatedEvaluations, sourceImport);
@@ -806,6 +858,9 @@ export default function ExcelIntegrationCenter({
 
     setSuccessMessage(`داده‌های تولید و کیفیت MIS با موفقیت در شاخص‌های تولیدی ${totalProcessed} پرونده ارزیابی نشست و پایدار شد (${slotsPopulated} اسلات نمره). معیارهای دستی سرپرست بدون تغییر محافظت شدند.`);
     setIsMisConfirmOpen(false);
+    } catch (error) { setErrorMessage(error instanceof Error ? error.message : 'ذخیره ابری ناموفق بود؛ پیش‌نمایش حفظ شد.'); }
+    finally { importSubmitting.current = false; setIsProcessing(false); setIsKasraApplying(false); }
+
   };
 
   // Filtered Dynamic Records for table
@@ -981,7 +1036,8 @@ export default function ExcelIntegrationCenter({
         </div>
 
         {/* FEEDBACK MESSAGES */}
-        {successMessage && (
+        {isProcessing && <p role="status" className="p-3 text-teal-300">در حال پردازش فایل یا ذخیره ابری؛ نتیجه پس از تأیید سرور نمایش داده می‌شود…</p>}
+      {successMessage && (
           <div className="mx-6 mt-4 p-3 bg-emerald-500/10 border border-emerald-500/20 text-emerald-300 rounded-2xl text-xs font-bold flex items-center justify-between gap-2 shrink-0 animate-fade-in">
             <div className="flex items-center gap-2">
               <CheckCircle2 className="w-4 h-4 text-emerald-400 shrink-0" />
@@ -1279,7 +1335,8 @@ export default function ExcelIntegrationCenter({
                   </div>
 
                   {/* Table Scrollable Container */}
-                  <div className="overflow-x-auto max-h-[500px]">
+                  <PreviewPages count={filteredDynamicRecords.length} />
+                <div className="overflow-x-auto max-h-[500px]">
                     <table className="w-full text-right text-xs border-collapse">
                       <thead className="bg-slate-900/90 text-slate-300 sticky top-0 z-10 border-b border-slate-800">
                         <tr>
@@ -1302,7 +1359,7 @@ export default function ExcelIntegrationCenter({
                         </tr>
                       </thead>
                       <tbody className="divide-y divide-slate-800/50 text-slate-300">
-                        {filteredDynamicRecords.map((rec, rIdx) => {
+                        {filteredDynamicRecords.slice(previewPage * 50, previewPage * 50 + 50).map((rec, rIdx) => {
                           const isInvalid = !rec.isValid;
 
                           return (
@@ -1717,7 +1774,9 @@ export default function ExcelIntegrationCenter({
                     </div>
 
                     <label className="flex items-center gap-2 rounded-xl border border-slate-800 bg-slate-950/70 px-3 py-2 text-xs"><SearchInput resultCount={filteredKasraPreviewRows.length} aria-label="جستجوی پیش‌نمایش کسری با کد پرسنلی" value={searchTerm} onChange={event => setSearchTerm(event.target.value)} placeholder="جستجو با نام یا کد پرسنلی" /></label>
-                    <div className="overflow-x-auto max-h-80 rounded-2xl border border-slate-800">
+                    <PreviewPages count={filteredKasraPreviewRows.length} />
+
+                <div className="overflow-x-auto max-h-80 rounded-2xl border border-slate-800">
                       <table className="w-full text-right text-xs">
                         <thead className="bg-slate-900 text-slate-300">
                           <tr>
@@ -1731,7 +1790,7 @@ export default function ExcelIntegrationCenter({
                           </tr>
                         </thead>
                         <tbody className="divide-y divide-slate-800/50">
-                          {filteredKasraPreviewRows.map(row => (
+                          {filteredKasraPreviewRows.slice(previewPage * 50, previewPage * 50 + 50).map(row => (
                             <tr key={row.record.id} className={row.status === 'valid' ? 'hover:bg-slate-900/40' : 'bg-rose-500/5'}>
                               <td className="p-2.5 font-mono font-bold text-teal-400">{row.record.empCode}</td>
                               <td className="p-2.5 font-bold text-slate-200">{row.employee?.name || row.record.empName || '—'}</td>
@@ -1836,7 +1895,9 @@ export default function ExcelIntegrationCenter({
                     </div>
 
                     <label className="flex items-center gap-2 rounded-xl border border-slate-800 bg-slate-950/70 px-3 py-2 text-xs"><SearchInput resultCount={filteredMisRecords.length} aria-label="جستجوی پیش‌نمایش MIS با کد پرسنلی" value={searchTerm} onChange={event => setSearchTerm(event.target.value)} placeholder="جستجو با نام یا کد پرسنلی" /></label>
-                    <div className="overflow-x-auto max-h-80 rounded-2xl border border-slate-800">
+                    <PreviewPages count={filteredMisRecords.length} />
+
+                <div className="overflow-x-auto max-h-80 rounded-2xl border border-slate-800">
                       <table className="w-full text-right text-xs">
                         <thead className="bg-slate-900 text-slate-300">
                           <tr>
@@ -1850,7 +1911,7 @@ export default function ExcelIntegrationCenter({
                           </tr>
                         </thead>
                         <tbody className="divide-y divide-slate-800/50">
-                          {filteredMisRecords.map(r => (
+                          {filteredMisRecords.slice(previewPage * 50, previewPage * 50 + 50).map(r => (
                             <tr key={r.id} className="hover:bg-slate-900/40">
                               <td className="p-2.5 font-mono font-bold text-emerald-400">{r.empCode}</td>
                               <td className="p-2.5 font-bold text-slate-200">{r.empName}</td>
@@ -1870,8 +1931,8 @@ export default function ExcelIntegrationCenter({
                 {isMisConfirmOpen && <div className="fixed inset-0 z-[100] flex items-center justify-center bg-slate-950/80 p-4" role="dialog" aria-modal="true" aria-labelledby="mis-confirm-title">
                   <div className="w-full max-w-lg space-y-4 rounded-2xl border border-emerald-500/30 bg-slate-900 p-5 text-right shadow-2xl">
                     <h3 id="mis-confirm-title" className="text-sm font-black text-slate-100">تأیید درون‌ریزی داده‌های MIS</h3>
-                    <p className="text-xs leading-6 text-slate-300">دوره: <strong>{misExpectedPeriod}</strong> · رکوردهای معتبر: <strong>{misRecords.length}</strong>. فقط مقادیر MIS با کد پرسنلی منطبق در ارزیابی‌های همین دوره ثبت می‌شوند؛ امتیازهای دستی سرپرست حفظ و مقادیر MIS پس از ثبت فقط‌خواندنی خواهند بود.</p>
-                    <div className="flex justify-end gap-2"><button type="button" onClick={() => setIsMisConfirmOpen(false)} className="rounded-xl bg-slate-700 px-4 py-2 text-xs font-bold text-white">بازگشت به پیش‌نمایش</button><button type="button" onClick={handleApplyMISRecords} className="rounded-xl bg-emerald-500 px-4 py-2 text-xs font-black text-slate-950">تأیید و اعمال {misRecords.length} رکورد</button></div>
+                    <p className="text-xs leading-6 text-slate-300">دوره: <strong>{misExpectedPeriod}</strong> · رکوردهای معتبر: <strong>{misRecords.length}</strong> · واجد شرایط: <strong>{misEligibleCount}</strong> · ردشده: <strong>{misRecords.length - misEligibleCount}</strong>. فقط مقادیر MIS با کد پرسنلی منطبق در ارزیابی‌های همین دوره ثبت می‌شوند؛ امتیازهای دستی سرپرست حفظ و مقادیر MIS پس از ثبت فقط‌خواندنی خواهند بود.</p>
+                    <div className="flex justify-end gap-2"><button type="button" onClick={() => setIsMisConfirmOpen(false)} className="rounded-xl bg-slate-700 px-4 py-2 text-xs font-bold text-white">بازگشت به پیش‌نمایش</button><button type="button" onClick={handleApplyMISRecords} disabled={isProcessing || !misEligibleCount} className="rounded-xl bg-emerald-500 px-4 py-2 text-xs font-black text-slate-950">تأیید و اعمال {misEligibleCount} رکورد</button></div>
                   </div>
                 </div>}
               </div>
@@ -1917,3 +1978,7 @@ export default function ExcelIntegrationCenter({
     </div>
   );
 }
+
+
+
+

@@ -195,6 +195,14 @@ export function mergeBackupCollections(incoming: Record<string, any>, current: R
 }
 
 export class AppDatabase {
+  private remoteAuditHistory: unknown[] | null = null;
+  private workflowContacts: Employee[] = [];
+
+  public getWorkflowRoutingEmployees(employees: Employee[]): Employee[] {
+    const directory = new Map(this.workflowContacts.map(person => [person.id, person]));
+    employees.forEach(person => directory.set(person.id, person));
+    return [...directory.values()];
+  }
   private syncTimeout: any = null;
   private listeners: Set<(key: string, data: any) => void> = new Set();
 
@@ -587,42 +595,154 @@ export class AppDatabase {
     this.setItem(STORAGE_KEYS.EVALUATIONS, evaluations);
   }
 
+  private bulkCommitQueue: Promise<unknown> = Promise.resolve();
+  private managedBulkCommit = false;
+  private pendingBulkOperation: { id: string; updates: Evaluation[] } | null = null;
+  private pendingStateCommit: { id: string; state: CloudState } | null = null;
+  private bulkRecoveryKey(): string { return `pe_bulk_pending_operation:${this.activeSyncUserId || 'anonymous'}`; }
+  public hasPendingBulkOperation(): boolean { return Boolean(localStorage.getItem(this.bulkRecoveryKey())); }
+  private async recordFingerprint(record: unknown): Promise<string> {
+    const bytes = new TextEncoder().encode(JSON.stringify(record) || 'missing');
+    const digest = await crypto.subtle.digest('SHA-256', bytes);
+    return Array.from(new Uint8Array(digest), byte => byte.toString(16).padStart(2, '0')).join('');
+  }
+  /** Existing administrative bulk collections still pass the normal server guards. */
+  public commitBulkState(state: CloudState, operationId: string, expectedRaw?: Record<string, string | null>, sourceImport?: SourceImportContext): Promise<boolean> {
+    const task = this.bulkCommitQueue.then(async () => {
+      while (this.isSyncing) await new Promise(resolve => setTimeout(resolve, 10));
+      if (!this.cloudSyncEnabled || this.hasRevisionConflict) return false;
+      const keys = Object.keys(state);
+      if (!keys.length || keys.some(key => !isCloudSyncKey(key))) return false;
+      if (expectedRaw && keys.some(key => expectedRaw[key] !== undefined && localStorage.getItem(key) !== expectedRaw[key])) return false;
+      const previous = new Map(keys.map(key => [key, localStorage.getItem(key)]));
+      const dirtyBefore = new Set(this.dirtyKeys);
+      const generation = this.syncGeneration;
+      const recoveryKey = this.bulkRecoveryKey();
+      this.managedBulkCommit = true;
+      this.pendingStateCommit = { id: operationId, state };
+      this.pendingSourceImportContext = sourceImport || null;
+      this.terminalRejectedSnapshot = null;
+      if (this.syncTimeout) { clearTimeout(this.syncTimeout); this.syncTimeout = null; }
+      try {
+        const stateExpectedHashes = await Promise.all(Array.from(previous, async ([key, raw]) => [key, await this.recordFingerprint(raw)]));
+        localStorage.setItem(recoveryKey, JSON.stringify({ operationId, state, stateExpectedHashes, sourceImport, createdAt: Date.now() }));
+        for (const key of keys) { localStorage.setItem(key, JSON.stringify(state[key])); this.dirtyKeys.add(key); }
+        if (keys.some(key => localStorage.getItem(key) !== JSON.stringify(state[key]))) return false;
+        const accepted = await this.pushStateToCloud(keys);
+        if (generation !== this.syncGeneration) return false;
+        if (accepted) { localStorage.removeItem(recoveryKey); return true; }
+        this.restoreRawStorage(previous);
+        for (const key of keys) if (!dirtyBefore.has(key)) this.dirtyKeys.delete(key);
+        return false;
+      } catch {
+        if (generation === this.syncGeneration) {
+          this.restoreRawStorage(previous);
+          for (const key of keys) if (!dirtyBefore.has(key)) this.dirtyKeys.delete(key);
+        }
+        return false;
+      }
+      finally { this.clearCloudRetry(); this.pendingStateCommit = null; this.pendingSourceImportContext = null; this.managedBulkCommit = false; }
+    });
+    this.bulkCommitQueue = task.catch(() => false);
+    return task.catch(() => false);
+  }
+
+  /** A changed-set commit. Local staging is not success; only a server ACK is. */
+  public commitEvaluationChanges(updates: Evaluation[], operationId: string, sourceImport?: ProtectedSourceImportContext, expected?: Evaluation[]): Promise<boolean> {
+    const task = this.bulkCommitQueue.then(async () => {
+      if (!this.cloudSyncEnabled || !updates.length) return false;
+      while (this.isSyncing) await new Promise(resolve => setTimeout(resolve, 10));
+      if (!this.cloudSyncEnabled || this.hasRevisionConflict) return false;
+      const current = this.getEvaluations();
+      const byId = new Map(current.map(record => [record.id, record]));
+      if (expected?.some(record => JSON.stringify(byId.get(record.id)) !== JSON.stringify(record))) {
+        this.emitCloudStatus('conflict', 'پرونده پس از پیش‌نمایش تغییر کرده است؛ پیش‌نمایش را دوباره بررسی کنید.', { conflict: true });
+        return false;
+      }
+      const changes = new Map(updates.map(record => [record.id, record]));
+      if (changes.size !== updates.length) return false;
+      const next = current.map(record => changes.get(record.id) || record);
+      for (const record of updates) if (!byId.has(record.id)) next.push(record);
+      const key = STORAGE_KEYS.EVALUATIONS;
+      const requestGeneration = this.syncGeneration;
+      const recoveryKey = this.bulkRecoveryKey();
+      const previousRaw = localStorage.getItem(key);
+      const wasDirty = this.dirtyKeys.has(key);
+      const nextRaw = JSON.stringify(next);
+      if (this.syncTimeout) { clearTimeout(this.syncTimeout); this.syncTimeout = null; }
+      this.managedBulkCommit = true;
+      this.pendingBulkOperation = { id: operationId, updates };
+      this.pendingSourceImportContext = sourceImport || null;
+      this.terminalRejectedSnapshot = null;
+      // A local, unsynchronized recovery record survives reload; it is never uploaded as state.
+      try {
+        // Store fingerprints rather than a second full copy of every original record.
+        // Large previews otherwise exhaust the browser's local storage quota.
+        const expectedHashes = await Promise.all((expected || []).map(async record => [record.id, await this.recordFingerprint(record)]));
+        localStorage.setItem(recoveryKey, JSON.stringify({ operationId, updates, sourceImport, expectedHashes, createdAt: Date.now() }));
+        // Stage without publishing optimistic application state or a saved indicator.
+        localStorage.setItem(key, nextRaw);
+        this.dirtyKeys.add(key);
+        if (localStorage.getItem(key) !== nextRaw) return false;
+        const accepted = await this.pushStateToCloud([key]);
+        if (requestGeneration !== this.syncGeneration) return false;
+        if (accepted) { localStorage.removeItem(recoveryKey); return true; }
+        if (localStorage.getItem(key) === nextRaw) {
+          if (previousRaw === null) localStorage.removeItem(key); else localStorage.setItem(key, previousRaw);
+          if (wasDirty) this.dirtyKeys.add(key); else this.dirtyKeys.delete(key);
+        }
+        return false;
+      } catch (error) {
+        if (requestGeneration === this.syncGeneration && localStorage.getItem(key) === nextRaw) {
+          if (previousRaw === null) localStorage.removeItem(key); else localStorage.setItem(key, previousRaw);
+          if (!wasDirty) this.dirtyKeys.delete(key);
+        }
+        this.emitCloudStatus('error', 'ذخیره تأیید نشد؛ فضای محلی و نتیجه ابری را پیش از تلاش دوباره بررسی کنید.');
+        console.error('Bulk commit failed', error);
+        return false;
+      } finally {
+        this.clearCloudRetry();
+        this.pendingBulkOperation = null;
+        this.pendingSourceImportContext = null;
+        this.managedBulkCommit = false;
+      }
+    });
+    this.bulkCommitQueue = task.catch(() => false);
+    return task.catch(() => false);
+  }
+
+  public async retryPendingBulkOperation(): Promise<boolean> {
+    try {
+      const pending = JSON.parse(localStorage.getItem(this.bulkRecoveryKey()) || 'null');
+      if (pending?.state) {
+        for (const [key, hash] of pending.stateExpectedHashes || []) {
+          const raw = localStorage.getItem(key);
+          if (raw !== JSON.stringify(pending.state[key]) && await this.recordFingerprint(raw) !== hash) return false;
+        }
+        return this.commitBulkState(pending.state, pending.operationId, undefined, pending.sourceImport);
+      }
+      if (!pending?.operationId || !Array.isArray(pending.updates)) return false;
+      const current = new Map(this.getEvaluations().map(record => [record.id, record]));
+      // A reload may already contain the accepted version. Let the receipt confirm it.
+      const intended = new Map<string, Evaluation>(pending.updates.map((record: Evaluation) => [record.id, record]));
+      for (const [id, fingerprint] of pending.expectedHashes || []) {
+        if (JSON.stringify(current.get(id)) !== JSON.stringify(intended.get(id)) && await this.recordFingerprint(current.get(id)) !== fingerprint) return false;
+      }
+      const expected = (pending.expected || []).filter((record: Evaluation) => JSON.stringify(current.get(record.id)) !== JSON.stringify(intended.get(record.id)));
+      return this.commitEvaluationChanges(pending.updates, pending.operationId, pending.sourceImport, expected);
+    } catch { return false; }
+  }
+
   /** Save one audited protected-source batch and wait for the Pages/KV decision. */
   private async saveStateWithSourceImport(key: string, value: unknown, sourceImport: SourceImportContext): Promise<boolean> {
-    if (!this.cloudSyncEnabled || this.pendingSourceImportContext) return false;
-    let waitCount = 0;
-    while (this.isSyncing && waitCount < 1_600) {
-      await new Promise(resolve => setTimeout(resolve, 10));
-      waitCount++;
-    }
-    if (!this.cloudSyncEnabled || this.isSyncing || this.pendingSourceImportContext) return false;
-    const previousRaw = localStorage.getItem(key);
-    const previousDirty = this.dirtyKeys.has(key);
-    const nextRaw = JSON.stringify(value);
-    if (previousRaw === nextRaw) return false;
-    this.pendingSourceImportContext = sourceImport;
-    this.terminalRejectedSnapshot = null;
-    this.setItem(key, value, false);
-    if (localStorage.getItem(key) !== nextRaw) {
-      this.pendingSourceImportContext = null;
-      return false;
-    }
-    const saved = await this.pushStateToCloud([key]);
-    if (saved) return true;
-
-    if (this.pendingSourceImportContext?.operationId === sourceImport.operationId) this.pendingSourceImportContext = null;
-    if (localStorage.getItem(key) === nextRaw) {
-      if (previousRaw === null) localStorage.removeItem(key);
-      else localStorage.setItem(key, previousRaw);
-      if (previousDirty) this.dirtyKeys.add(key);
-      else if (previousRaw === this.lastSyncedValues.get(key)) this.dirtyKeys.delete(key);
-      else if (previousRaw !== null) this.dirtyKeys.add(key);
-    }
-    return false;
+    return this.commitBulkState({ [key]: value }, sourceImport.operationId, undefined, sourceImport);
   }
 
   public saveEvaluationsWithSourceImport(evaluations: Evaluation[], sourceImport: ProtectedSourceImportContext): Promise<boolean> {
-    return this.saveStateWithSourceImport(STORAGE_KEYS.EVALUATIONS, evaluations, sourceImport);
+    const current = this.getEvaluations();
+    const existing = new Map(current.map(record => [record.id, record]));
+    const changed = evaluations.filter(record => JSON.stringify(record) !== JSON.stringify(existing.get(record.id)));
+    return this.commitEvaluationChanges(changed, sourceImport.operationId, sourceImport, current.filter(record => changed.some(update => update.id === record.id)));
   }
 
   public saveEmployeesWithSourceImport(employees: Employee[], sourceImport: MasterDataSourceImportContext): Promise<boolean> {
@@ -808,6 +928,7 @@ export class AppDatabase {
   }
 
   public getMiscData<T>(key: string, fallback: T): T {
+    if (key === 'pe_audit_logs' && this.remoteAuditHistory) return this.remoteAuditHistory as T;
     return this.getItem<T>(key, fallback);
   }
   public saveMiscData<T>(key: string, value: T): void {
@@ -984,6 +1105,8 @@ export class AppDatabase {
   }
 
   public stopCloudSync(): void {
+    this.workflowContacts = [];
+    this.remoteAuditHistory = null;
     this.syncGeneration += 1;
     this.cloudSyncEnabled = false;
     clearTimeout(this.syncTimeout);
@@ -1116,7 +1239,7 @@ export class AppDatabase {
   }
 
   private async runSyncCycle(mode: 'pull' | 'push' | 'auto', forceAll = false, explicitRetry = false, onlyKeys?: string[]): Promise<boolean | null> {
-    if (this.isSyncing) return null;
+    if (this.isSyncing || (this.managedBulkCommit && mode !== 'push')) return null;
     this.isSyncing = true;
     this.detectDirectStorageChanges();
     const attemptedEntries = Array.from(this.dirtyKeys).map(key => [key, localStorage.getItem(key)] as [string, string | null]);
@@ -1135,7 +1258,7 @@ export class AppDatabase {
       const currentEntries = Array.from(this.dirtyKeys).map(key => [key, localStorage.getItem(key)] as [string, string | null]);
       const currentFingerprint = cloudWriteFingerprint(this.cloudRevision, currentEntries);
       if (shouldScheduleCloudSyncFollowup({
-        enabled: this.cloudSyncEnabled,
+        enabled: this.cloudSyncEnabled && !this.managedBulkCommit,
         hasConflict: this.hasRevisionConflict,
         dirtyKeyCount: this.dirtyKeys.size,
         attemptedFingerprint,
@@ -1148,8 +1271,19 @@ export class AppDatabase {
   }
 
   private applyRemoteState(remoteState: CloudState): void {
+    this.workflowContacts = Array.isArray(remoteState.pe_workflow_contacts) ? remoteState.pe_workflow_contacts as Employee[] : [];
     let changed = false;
     for (const key of CLOUD_SYNC_KEYS) {
+      if (key === 'pe_audit_logs') {
+        // Immutable server audit history can be much larger than browser storage.
+        // Preserve the complete server response in memory; never upload a truncated cache.
+        this.remoteAuditHistory = Array.isArray(remoteState[key]) ? remoteState[key] as unknown[] : [];
+        localStorage.removeItem(key);
+        this.dirtyKeys.delete(key);
+        this.lastSyncedValues.set(key, null);
+        this.notifyChange(key, this.remoteAuditHistory);
+        continue;
+      }
       if (this.dirtyKeys.has(key)) continue;
       const hasRemoteValue = Object.prototype.hasOwnProperty.call(remoteState, key);
       const nextRaw = hasRemoteValue ? JSON.stringify(remoteState[key]) : null;
@@ -1349,6 +1483,8 @@ export class AppDatabase {
       }
 
       const sourceImportContext = this.pendingSourceImportContext;
+      const bulkOperation = this.pendingBulkOperation || this.pendingStateCommit;
+      if (this.pendingBulkOperation) changes.pe_evaluations = this.pendingBulkOperation.updates;
       const fingerprintEntries: Array<[string, string | null]> = Array.from(sentRaw.entries());
       if (sourceImportContext) fingerprintEntries.push(['sourceImport', JSON.stringify(sourceImportContext)]);
       const fingerprint = cloudWriteFingerprint(this.cloudRevision, fingerprintEntries);
@@ -1378,6 +1514,7 @@ export class AppDatabase {
           baseRevision: this.cloudRevision,
           clientId: this.getClientId(),
           ...(sourceImportContext ? { sourceImport: sourceImportContext } : {}),
+          ...(bulkOperation ? { operationId: bulkOperation.id, ...(this.pendingBulkOperation ? { evaluationPatch: true } : {}) } : {}),
         })
       });
       if (!isCurrentSyncGeneration(requestGeneration, this.syncGeneration)) return false;
@@ -1603,3 +1740,4 @@ export class AppDatabase {
 }
 
 export const db = new AppDatabase();
+

@@ -1,3 +1,4 @@
+import { calibrationCounts } from '../utils/calibrationState';
 /**
  * @license
  * SPDX-License-Identifier: Apache-2.0
@@ -241,8 +242,9 @@ export default function Dashboard({
       ? { title: `${assignedTasks.toLocaleString('fa-IR')} پرونده در کارتابل شما نیازمند اقدام است`, tab: 'workflow', description: 'پرونده‌های واگذارشده به شما در کارتابل منتظر اقدام هستند.' }
       : { title: 'وضعیت ارزیابی‌های کارکنان مجاز را بررسی کنید', tab: 'evaluations', description: 'در حال حاضر پرونده‌ای در کارتابل شما منتظر اقدام نیست.' };
 
-  const completedEvals = evaluations.filter(e => e.status === 'locked');
-  const calibratedEvals = evaluations.filter(e => e.status === 'calibrated');
+  const completedEvals = evaluations.filter(e => e.stage === 'completed' && e.status === 'locked');
+  const calibratedEvals = evaluations.filter(e => ['hr_approval', 'feedback_meeting'].includes(e.stage || ''));
+  const calibrationReadyCount = calibrationCounts(evaluations).ready.length;
   const draftEvals = evaluations.filter(e => e.status === 'draft');
 
   // Calculate overall performance score for locked/calibrated evals (or scored evals if none locked yet)
@@ -499,7 +501,7 @@ export default function Dashboard({
 
               <div>
                 <div className="flex justify-between mb-1.5 text-slate-400">
-                  <span>کالیبره شده / در انتظار تایید ({calibratedEvals.length} مورد)</span>
+                  <span>تأیید کمیته ({calibratedEvals.length}) · آماده کمیته ({calibrationReadyCount})</span>
                   <span className="font-semibold text-slate-300">{evaluations.length ? Math.round((calibratedEvals.length / evaluations.length) * 100) : 0}٪</span>
                 </div>
                 <div className="w-full h-2 bg-slate-800 rounded-full overflow-hidden">

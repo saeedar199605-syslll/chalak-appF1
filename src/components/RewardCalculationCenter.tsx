@@ -23,7 +23,7 @@ import { db } from '../utils/db';
 import { downloadWorkbook, recordsToRows } from '../utils/excelWorkbook';
 
 interface RewardCalculationCenterProps {
-  onBulkUpdateEvaluations?: (evals: Evaluation[]) => void;
+  onBulkUpdateEvaluations?: (evals: Evaluation[]) => boolean | Promise<boolean>;
   evaluations: Evaluation[];
   employees: Employee[];
   profiles: JobProfile[];
@@ -165,7 +165,7 @@ export default function RewardCalculationCenter({
 
   
   
-  const handleBatchExportToDB = () => {
+  const handleBatchExportToDB = async () => {
     if (displayData.length === 0) {
       alert('رکوردی برای استخراج یافت نشد.');
       return;
@@ -181,7 +181,7 @@ export default function RewardCalculationCenter({
         return ev;
       });
       // The callback replaces the full evaluation collection; never pass a subset.
-      onBulkUpdateEvaluations(updatedEvals);
+      if ((await onBulkUpdateEvaluations(updatedEvals)) !== true) { alert('سرور ذخیره گروهی پاداش را تأیید نکرد؛ تاریخچه تغییر نکرد.'); return; }
     }
     
     // 2. Save Batch History to DB
@@ -274,7 +274,7 @@ export default function RewardCalculationCenter({
                 تاریخچه خروجی‌های پاداش
               </h2>
               <button 
-                onClick={() => {
+                onClick={async () => {
                   if(confirm('آیا از حذف تمام تاریخچه اطمینان دارید؟')) {
                     db.saveMiscData('pe_reward_batch_history', []);
                     setBatchHistory([]);
@@ -303,7 +303,7 @@ export default function RewardCalculationCenter({
                       </div>
                       <button
                         
-                        onClick={() => {
+                        onClick={async () => {
                           if (!confirm('آیا از حذف این تاریخچه و پاکسازی مبلغ پاداش پرسنل مربوطه اطمینان دارید؟')) return;
                           // Clear finalReward for all records in this batch
                           if (onBulkUpdateEvaluations) {
@@ -317,8 +317,8 @@ export default function RewardCalculationCenter({
                                  if (matches.length === 1) targetIds.add(matches[0].id);
                                }
                              }
-                             if (targetIds.size > 0) onBulkUpdateEvaluations(evaluations.map(ev =>
-                               targetIds.has(ev.id) ? { ...ev, finalReward: undefined } : ev));
+                             if (targetIds.size > 0 && (await onBulkUpdateEvaluations(evaluations.map(ev =>
+                               targetIds.has(ev.id) ? { ...ev, finalReward: undefined } : ev))) !== true) { alert('سرور پاکسازی گروهی را تأیید نکرد؛ تاریخچه حفظ شد.'); return; }
                           }
                           const updated = batchHistory.filter(b => b.id !== batch.id);
                           db.saveMiscData('pe_reward_batch_history', updated);
@@ -511,7 +511,7 @@ export default function RewardCalculationCenter({
                   </div>
                   <div className="mt-4 pt-4 border-t border-slate-800 flex justify-between items-center">
                     <span className="text-xs font-bold text-slate-400">نتیجه شبیه‌سازی:</span>
-                    <button type="button" onClick={() => {
+                    <button type="button" onClick={async () => {
                       const score = Number((document.getElementById('sim-score') as HTMLInputElement).value) || 0;
                       const baseAmount = Number((document.getElementById('sim-base') as HTMLInputElement).value) || 0;
                       const multiplier = Number((document.getElementById('sim-mult') as HTMLInputElement).value) || 0;
@@ -641,7 +641,7 @@ export default function RewardCalculationCenter({
                       </div>
                       {config.coefficients.length > 1 && (
                         <button 
-                          onClick={() => {
+                          onClick={async () => {
                             const newCoefs = config.coefficients.filter((_, idx) => idx !== i);
                             setConfig({ ...config, coefficients: newCoefs });
                           }}
@@ -718,7 +718,7 @@ export default function RewardCalculationCenter({
                       </div>
                       {config.multipliers.length > 1 && (
                         <button 
-                          onClick={() => {
+                          onClick={async () => {
                             const newMults = config.multipliers.filter((_, idx) => idx !== i);
                             setConfig({ ...config, multipliers: newMults });
                           }}
@@ -739,3 +739,4 @@ export default function RewardCalculationCenter({
     </div>
   );
 }
+

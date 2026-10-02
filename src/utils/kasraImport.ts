@@ -46,6 +46,13 @@ export function buildKasraPreviewRows(input: {
     const key = normalizePersonnelCode(employee.code);
     if (key) employeesByCode.set(key, [...(employeesByCode.get(key) || []), employee]);
   });
+  const profilesById = new Map(profiles.map(profile => [profile.id, profile]));
+  const criterionById = new Map(criteria.flatMap(criterion => [[criterion.id, criterion], [criterion.code, criterion]] as Array<[string, Criterion]>));
+  const evaluationsByEmployeePeriod = new Map<string, Evaluation[]>();
+  for (const evaluation of evaluations) {
+    const key = `${evaluation.empId}\u0000${getEvaluationPeriodId(evaluation)}`;
+    const list = evaluationsByEmployeePeriod.get(key) || []; list.push(evaluation); evaluationsByEmployeePeriod.set(key, list);
+  }
 
   return records.map((record, index) => {
     const invalid = (status: KasraPreviewStatus, issue: string, employee?: Employee, evaluation?: Evaluation): KasraPreviewRow => ({
@@ -61,7 +68,7 @@ export function buildKasraPreviewRows(input: {
       return invalid('period_mismatch', 'شناسه دوره فایل با دوره انتخاب‌شده برابر نیست.', employee);
     }
     if (!selectedPeriodId) return invalid('period_mismatch', 'دوره ارزیابی انتخاب نشده است.', employee);
-    const employeeEvaluations = evaluations.filter(item => item.empId === employee.id && getEvaluationPeriodId(item) === selectedPeriodId);
+    const employeeEvaluations = evaluationsByEmployeePeriod.get(`${employee.id}\u0000${selectedPeriodId}`) || [];
     if (employeeEvaluations.length > 1) return invalid('duplicate', 'برای این کارمند بیش از یک ارزیابی در دوره انتخاب‌شده وجود دارد.', employee);
     const evaluation = employeeEvaluations[0];
     if (!evaluation) return invalid('missing_evaluation', 'برای این کارمند در دوره انتخاب‌شده ارزیابی ایجاد نشده است.', employee);
@@ -71,10 +78,9 @@ export function buildKasraPreviewRows(input: {
       return invalid('invalid_metric', 'یکی از شاخص‌های حضور، غیبت، انضباط یا نمره محاسبه‌شده معتبر نیست.', employee, evaluation);
     }
 
-    const profile = profiles.find(item => item.id === evaluation.profileId);
+    const profile = profilesById.get(evaluation.profileId);
     if (!profile) return invalid('missing_profile', 'پروفایل ارزیابی این کارمند معتبر نیست.', employee, evaluation);
     const scoreByCid = new Map(evaluation.scores.map(score => [score.cid, score]));
-    const criterionById = new Map(criteria.map(criterion => [criterion.id, criterion]));
     const kasraCriteria = profile.items.flatMap(item => {
       const criterion = criterionById.get(item.cid) || criteria.find(candidate => candidate.code === item.cid);
       return criterion?.scoringSource === 'kasra' && criterion.autoPopulate !== false ? [{ item, criterion }] : [];

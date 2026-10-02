@@ -103,11 +103,11 @@ interface WorkflowManagerProps {
   criteria: Criterion[];
   delegations?: DelegationRecord[];
   onUpdateEvaluation: (id: string, updatedEv: Evaluation) => void;
-  onBulkUpdateEvaluations?: (updatedEvaluations: Evaluation[]) => void;
-  onUpdateEmployees?: (updatedEmployees: Employee[]) => void;
+  onBulkUpdateEvaluations?: (updatedEvaluations: Evaluation[], sourceImport?: undefined, operationId?: string) => boolean | Promise<boolean> | void;
+  onUpdateEmployees?: (updatedEmployees: Employee[]) => boolean | Promise<boolean>;
   onSelectEvaluation?: (id: string) => void;
   onDeleteEvaluation?: (id: string) => void;
-  onBulkDeleteEvaluations?: (ids: string[]) => void;
+  onBulkDeleteEvaluations?: (ids: string[]) => boolean | Promise<boolean>;
   onUpdateDelegations?: (delegations: DelegationRecord[]) => void;
   notificationFocus?: { evaluationId: string; sequence: number } | null;
   theme: 'dark' | 'light';
@@ -289,7 +289,7 @@ export default function WorkflowManager({
     setEvalToDelete(null);
   };
 
-  const handleConfirmDeleteBulk = () => {
+  const handleConfirmDeleteBulk = async () => {
     // SECURITY: Bulk delete requires admin role (data destruction is admin-only)
     if (currentUser.role !== 'admin') {
       displayToast('دسترسی رد شد: حذف انبواع فقط برای مدیر سیستم مجاز است.', 'warning');
@@ -297,7 +297,7 @@ export default function WorkflowManager({
     }
     if (selectedEvalIds.length === 0) return;
     if (onBulkDeleteEvaluations) {
-      onBulkDeleteEvaluations(selectedEvalIds);
+      if ((await onBulkDeleteEvaluations(selectedEvalIds)) !== true) { displayToast('سرور حذف گروهی را تأیید نکرد؛ انتخاب‌ها حفظ شدند.', 'warning'); return; }
     } else if (onDeleteEvaluation) {
       selectedEvalIds.forEach(id => onDeleteEvaluation(id));
     } else {
@@ -306,12 +306,15 @@ export default function WorkflowManager({
       db.saveEvaluations(nextLocal);
       // syncToCloudNow removed — already debounced via setItem
     }
-    displayToast(`${selectedEvalIds.length} پرونده با موفقیت از سیستم حذف گردید.`, 'success');
-    setSelectedEvalIds([]);
+    const persistedIds = new Set(db.getEvaluations().map(e => e.id));
+    const retainedIds = selectedEvalIds.filter(id => persistedIds.has(id));
+    const deletedCount = selectedEvalIds.length - retainedIds.length;
+    displayToast(`${deletedCount} پرونده با موفقیت از سیستم حذف گردید.${retainedIds.length ? ` ${retainedIds.length} پرونده محافظت‌شده باقی ماند.` : ''}`, retainedIds.length ? 'warning' : 'success');
+    setSelectedEvalIds(retainedIds);
     setIsBulkDeleteModalOpen(false);
   };
 
-  const handleConfirmBulkRedirect = () => {
+  const handleConfirmBulkRedirect = async () => {
     // SECURITY: Bulk redirect is an admin_override action — requires admin role
     if (currentUser.role !== 'admin') {
       displayToast('دسترسی رد شد: این عملیات فقط برای مدیر سیستم مجاز است.', 'warning');
@@ -361,12 +364,8 @@ export default function WorkflowManager({
       return updated;
     });
 
-    setLocalEvaluations(nextLocalEvaluations);
-    if (onBulkUpdateEvaluations && updatedEvals.length > 0) {
-      onBulkUpdateEvaluations(nextLocalEvaluations);
-    } else {
-      db.saveEvaluations(nextLocalEvaluations);
-    }
+    if ((await onBulkUpdateEvaluations?.(nextLocalEvaluations)) !== true) { displayToast('سرور هدایت گروهی را تأیید نکرد؛ انتخاب‌ها حفظ شدند.', 'warning'); return; }
+    setLocalEvaluations(db.getEvaluations());
 
     displayToast(`${selectedEvalIds.length} پرونده با موفقیت به مرحله «${WORKFLOW_STAGES[bulkRedirectTargetStage]?.label}» هدایت گردیدند.`, 'success');
     setSelectedEvalIds([]);
@@ -385,7 +384,7 @@ export default function WorkflowManager({
   
   // Helper to dynamically resolve EXACT current assignee for any evaluation
   const resolveCurrentAssignee = (ev: Evaluation, emp: Employee | undefined) =>
-    resolveWorkflowAssignee(ev.stage || 'self_review', emp, employees);
+    resolveWorkflowAssignee(ev.stage || 'self_review', emp, db.getWorkflowRoutingEmployees(employees));
 
   // Normalize evaluations with stages and resolved assignees
   const normalizedEvaluations = useMemo(() => {
@@ -731,24 +730,31 @@ export default function WorkflowManager({
     }
   };
 
+  const bulkSubmitting = useRef(false);
+  const bulkOperationId = useRef(crypto.randomUUID());
+  const [bulkSaving, setBulkSaving] = useState(false);
+  const [bulkDestination, setBulkDestination] = useState<WorkflowStageKey | undefined>();
   const [bulkAdvancePreviewRows, setBulkAdvancePreviewRows] = useState<BulkAdvanceRow[] | null>(null);
   const bulkAdvanceReasonLabel: Record<BulkAdvanceReason, string> = {
     eligible: 'واجد شرایط', not_owned: 'مسئول پرونده نیستید', wrong_state: 'مرحله یا پرونده معتبر نیست',
-    missing_input: 'ورودی لازم ناقص است', permission_denied: 'مجوز کافی نیست', already_transitioned: 'پرونده پس از پیش‌نمایش تغییر کرده است',
+    missing_assignee: 'مسئول گام بعد تعیین نشده است', missing_input: 'ورودی لازم ناقص است', permission_denied: 'مجوز کافی نیست', already_transitioned: 'پرونده پس از پیش‌نمایش تغییر کرده است',
   };
 
-  const openBulkAdvancePreview = (ids: string[] = selectedEvalIds) => {
+  const openBulkAdvancePreview = (ids: string[] = selectedEvalIds, destination?: WorkflowStageKey) => {
     if (ids.length === 0) return;
     setSelectedEvalIds(ids);
-    const preview = previewBulkAdvance(ids, normalizedEvaluations, currentUser, employees, delegations || []);
-    setBulkAdvancePreviewRows(preview.rows);
+    const preview = previewBulkAdvance(ids, normalizedEvaluations, currentUser, db.getWorkflowRoutingEmployees(employees), delegations || []);
+    bulkOperationId.current = crypto.randomUUID();
+    setBulkDestination(destination);
+    setBulkAdvancePreviewRows(preview.rows.map(row => destination && row.toStage !== destination ? { ...row, reason: 'wrong_state' } : row));
   };
 
-  const handleConfirmBulkAdvance = () => {
+  const handleConfirmBulkAdvance = async () => {
     if (!bulkAdvancePreviewRows) return;
     const snapshot = bulkAdvancePreviewRows.map(({ evaluationId, fromStage, currentOwnerId }) => ({ evaluationId, fromStage, currentOwnerId }));
-    const fresh = previewBulkAdvance(selectedEvalIds, normalizedEvaluations, currentUser, employees, delegations || [], undefined, snapshot);
-    const changed = buildBulkAdvanceUpdates(fresh.rows, localEvaluations, employees, currentUser, Date.now());
+    const fresh = previewBulkAdvance(selectedEvalIds, normalizedEvaluations, currentUser, db.getWorkflowRoutingEmployees(employees), delegations || [], undefined, snapshot);
+    if (bulkDestination) fresh.rows = fresh.rows.map(row => row.toStage !== bulkDestination ? { ...row, reason: 'wrong_state' } : row);
+    const changed = buildBulkAdvanceUpdates(fresh.rows, localEvaluations, db.getWorkflowRoutingEmployees(employees), currentUser, Date.now());
     if (!changed.length) {
       setBulkAdvancePreviewRows(fresh.rows);
       displayToast('هیچ پرونده‌ای پس از بررسی دوباره واجد شرایط نماند.', 'warning');
@@ -756,9 +762,13 @@ export default function WorkflowManager({
     }
     const changedById = new Map(changed.map(evaluation => [evaluation.id, evaluation]));
     const nextLocalEvaluations = localEvaluations.map(evaluation => changedById.get(evaluation.id) || evaluation);
-    setLocalEvaluations(nextLocalEvaluations);
-    if (onBulkUpdateEvaluations) onBulkUpdateEvaluations(nextLocalEvaluations);
-    else db.saveEvaluations(nextLocalEvaluations);
+    if (bulkSubmitting.current) return;
+    bulkSubmitting.current = true; setBulkSaving(true);
+    let accepted = false;
+    try { accepted = (await onBulkUpdateEvaluations?.(nextLocalEvaluations, undefined, bulkOperationId.current)) === true; }
+    finally { bulkSubmitting.current = false; setBulkSaving(false); }
+    if (!accepted) { displayToast('سرور انتقال را تأیید نکرد؛ پیش‌نمایش و انتخاب‌ها حفظ شدند.', 'warning'); return; }
+    setLocalEvaluations(db.getEvaluations());
     const denied = fresh.rows.filter(row => row.reason !== 'eligible').length;
     displayToast(`${changed.length} پرونده منتقل شد؛ ${denied} پرونده به دلیل وضعیت یا مجوز کنار گذاشته شد.`, denied ? 'warning' : 'success');
     setSelectedEvalIds([]);
@@ -766,7 +776,7 @@ export default function WorkflowManager({
   };
 
   // Optimistic Apply Grouped for target stage
-  const handleApplyGroupedStage = (targetStage: WorkflowStageKey, actionTitle: string) => {
+  const handleApplyGroupedStage = async (targetStage: WorkflowStageKey, actionTitle: string) => {
     if (selectedEvalIds.length === 0) return;
 
     // SECURITY: Bulk stage redirection to arbitrary stages (e.g., completed, hr_approval)
@@ -843,13 +853,9 @@ export default function WorkflowManager({
 
     const affectedCount = updatedEvals.length;
 
-    // 1. Immediate optimistic UI reconciliation
-    setLocalEvaluations(nextLocalEvaluations);
+    if ((await onBulkUpdateEvaluations?.(nextLocalEvaluations)) !== true) { displayToast('سرور عملیات گروهی را تأیید نکرد؛ انتخاب‌ها حفظ شدند.', 'warning'); return; }
+    setLocalEvaluations(db.getEvaluations());
     setSelectedEvalIds([]);
-
-    // Persist the complete collection once; per-record callbacks would produce N sync triggers.
-    if (onBulkUpdateEvaluations) onBulkUpdateEvaluations(nextLocalEvaluations);
-    else db.saveEvaluations(nextLocalEvaluations);
 
     displayToast(`عملیات گروهی «${actionTitle}» بر روی ${affectedCount} پرونده با موفقیت و به‌صورت زنده اعمال گردید.`, 'success');
   };
@@ -1153,7 +1159,7 @@ export default function WorkflowManager({
   };
 
   // Batch Assign Supervisor / Approver Handler
-  const handleExecuteBatchAssign = () => {
+  const handleExecuteBatchAssign = async () => {
     if (!batchSupervisorId && !batchApproverId) {
       displayToast('لطفاً حداقل یک سرپرست یا تاییدکننده نهایی را انتخاب کنید.', 'warning');
       return;
@@ -1172,10 +1178,7 @@ export default function WorkflowManager({
       return item;
     });
 
-    db.saveEmployees(updatedList);
-    if (onUpdateEmployees) {
-      onUpdateEmployees(updatedList);
-    }
+    if ((await onUpdateEmployees?.(updatedList)) !== true) { displayToast('سرور انتساب گروهی را تأیید نکرد.', 'warning'); return; }
     displayToast(`ماتریس انتساب سرپرستان و تاییدکنندگان برای پرسنل واحد ${batchAssignUnit === 'all' ? 'کل سازمان' : batchAssignUnit} با موفقیت به‌روزرسانی شد.`, 'success');
   };
 
@@ -1747,7 +1750,7 @@ export default function WorkflowManager({
                 {/* Apply Grouped: Move to Calibration */}
                 <button
                   type="button"
-                  onClick={() => handleApplyGroupedStage('calibration_review', 'ارسال به کالیبراسیون')}
+                  onClick={() => openBulkAdvancePreview(selectedEvalIds, 'calibration_review')}
                   className="px-3.5 py-2 bg-purple-600/30 hover:bg-purple-600 text-purple-200 hover:text-white border border-purple-500/40 font-bold rounded-xl text-xs transition flex items-center gap-1.5 cursor-pointer"
                 >
                   <Scale className="w-4 h-4" />
@@ -3215,7 +3218,7 @@ export default function WorkflowManager({
             <div className="flex items-start gap-2 bg-rose-500/10 border border-rose-500/20 p-3 rounded-xl text-xs text-rose-300 leading-relaxed">
               <AlertCircle className="w-4 h-4 text-rose-400 shrink-0 mt-0.5" />
               <span>
-                توجه: این اقدام تمامی پرونده‌های انتخاب‌شده را از دیتابیس پاک کرده و غیرقابل بازیابی است.
+                توجه: پرونده‌های قابل حذف پس از تأیید سرور پاک می‌شوند؛ پرونده‌های نهایی و قفل‌شده باقی می‌مانند.
               </span>
             </div>
 
@@ -3340,7 +3343,7 @@ export default function WorkflowManager({
             </div>
             <footer className="p-4 border-t border-slate-800 flex justify-end gap-2">
               <button type="button" onClick={() => setBulkAdvancePreviewRows(null)} className="px-4 py-2 rounded-xl text-xs font-bold text-slate-300 bg-slate-800 hover:bg-slate-700">بازگشت</button>
-              <button type="button" disabled={!bulkAdvancePreviewRows.some(row => row.reason === 'eligible')} onClick={handleConfirmBulkAdvance} className="px-4 py-2 rounded-xl text-xs font-black text-slate-950 bg-teal-400 hover:bg-teal-300 disabled:opacity-40 disabled:cursor-not-allowed">تأیید و انتقال موارد واجد شرایط</button>
+              <button type="button" disabled={bulkSaving || !bulkAdvancePreviewRows.some(row => row.reason === 'eligible')} onClick={handleConfirmBulkAdvance} className="px-4 py-2 rounded-xl text-xs font-black text-slate-950 bg-teal-400 hover:bg-teal-300 disabled:opacity-40 disabled:cursor-not-allowed">تأیید و انتقال موارد واجد شرایط</button>
             </footer>
           </section>
         </div>,
@@ -3492,3 +3495,5 @@ export default function WorkflowManager({
     </div>
   );
 }
+
+

@@ -4,7 +4,7 @@ import SearchInput from './ui/SearchInput';
  * SPDX-License-Identifier: Apache-2.0
  */
 
-import React, { useState, useMemo, useEffect } from 'react';
+import React, { useState, useMemo, useEffect, useRef } from 'react';
 import { createPortal } from 'react-dom';
 import { validateEmployeeInput } from '../utils/validation';
 import { buildEmployeeBulkEditPreview, type EmployeeBulkPreviewRow } from '../utils/employeeBulkEdit';
@@ -47,7 +47,7 @@ interface EmployeesProps {
   evaluations?: Evaluation[];
   onAddEmployee: (emp: Omit<Employee, 'id'>) => void;
   onUpdateEmployee: (id: string, emp: Omit<Employee, 'id'>) => void;
-  onBulkUpdateEmployees?: (employees: Employee[]) => void;
+  onBulkUpdateEmployees?: (employees: Employee[], operationId?: string) => boolean | Promise<boolean>;
   onImportEmployees?: (employees: Employee[], sourceImport: MasterDataSourceImportContext) => Promise<boolean>;
   onDeleteEmployee: (id: string) => boolean | Promise<boolean>;
   onBulkDeleteEmployees?: (ids: string[]) => boolean | Promise<boolean>;
@@ -111,6 +111,7 @@ export default function Employees({
   const [employeeToDelete, setEmployeeToDelete] = useState<Employee | null>(null);
   const [deleteToast, setDeleteToast] = useState<string | null>(null);
   const [isDeleting, setIsDeleting] = useState(false);
+  const bulkDeletingRef = useRef(false);
   const [deleteError, setDeleteError] = useState<string | null>(null);
 
   // Bulk Selection State for Batch Actions
@@ -248,12 +249,14 @@ export default function Employees({
       ...(bulkAssignSupervisor ? { supervisorId: bulkAssignSupervisor } : {}),
       ...(bulkAssignProfile ? { profileId: bulkAssignProfile } : {}),
     });
+    assignmentOperationId.current = crypto.randomUUID();
     setBulkAssignPreview(preview.employees);
     setBulkAssignPreviewRows(preview.rows);
     setBulkAssignError('پیش‌نمایش آماده است؛ نتیجه را بررسی و سپس تأیید نهایی کنید.');
   };
 
-  const confirmBulkAssignment = () => {
+  const assignmentOperationId = useRef(crypto.randomUUID());
+  const confirmBulkAssignment = async () => {
     if (!onBulkUpdateEmployees || !bulkAssignPreview) return;
     const fresh = buildEmployeeBulkEditPreview(employees, selectedEmpIds, {
       ...(bulkAssignUnit.trim() ? { unit: bulkAssignUnit } : {}),
@@ -266,7 +269,7 @@ export default function Employees({
       setBulkAssignError('اطلاعات کارکنان هنگام پیش‌نمایش تغییر کرده است؛ تغییرهای تازه را دوباره بررسی کنید.');
       return;
     }
-    onBulkUpdateEmployees(fresh.employees);
+    if ((await onBulkUpdateEmployees(fresh.employees, assignmentOperationId.current)) !== true) { setBulkAssignError('سرور انتساب گروهی را تأیید نکرد؛ پیش‌نمایش حفظ شد.'); return; }
     const changed = fresh.rows.filter(row => JSON.stringify(row.before) !== JSON.stringify(row.after)).length;
     setDeleteToast(`تعداد ${changed} پرونده پرسنلی به‌روزرسانی شد.`);
     setIsBulkAssignOpen(false);
@@ -277,7 +280,8 @@ export default function Employees({
   };
 
   const handleConfirmBulkDelete = async () => {
-    if (selectedEmpIds.size === 0) return;
+    if (selectedEmpIds.size === 0 || bulkDeletingRef.current) return;
+    bulkDeletingRef.current = true;
     const count = selectedEmpIds.size;
     setIsDeleting(true);
     setDeleteError(null);
@@ -286,13 +290,17 @@ export default function Employees({
         ? await onBulkDeleteEmployees(Array.from(selectedEmpIds))
         : (await Promise.all(Array.from(selectedEmpIds).map((id: string) => onDeleteEmployee(id)))).every(Boolean);
       if (!succeeded) throw new Error('حذف گروهی کامل نشد. لطفاً اتصال و دسترسی خود را بررسی کنید.');
-      setSelectedEmpIds(new Set());
+      const remainingIds = new Set(db.getEmployees().map(person => person.id));
+      const retained = (Array.from(selectedEmpIds) as string[]).filter(id => remainingIds.has(id));
+      const deletedCount = count - retained.length;
+      setSelectedEmpIds(new Set(retained));
       setIsBulkDeleteModalOpen(false);
-      setDeleteToast(`تعداد ${count} پرونده پرسنلی با موفقیت به صورت گروهی حذف شدند.`);
+      setDeleteToast(`تعداد ${deletedCount} پرونده پرسنلی حذف شدند.${retained.length ? ` ${retained.length} پرونده محافظت‌شده باقی ماندند.` : ''}`);
       setTimeout(() => setDeleteToast(null), 4000);
     } catch (error) {
       setDeleteError(error instanceof Error ? error.message : 'حذف گروهی با خطا روبه‌رو شد.');
     } finally {
+      bulkDeletingRef.current = false;
       setIsDeleting(false);
     }
   };
@@ -1573,7 +1581,7 @@ export default function Employees({
             <div className="flex items-start gap-2 bg-rose-500/10 border border-rose-500/20 p-3 rounded-xl text-xs text-rose-300 leading-relaxed">
               <AlertTriangle className="w-4 h-4 text-rose-400 shrink-0 mt-0.5" />
               <span>
-                هشدار: این عملیات تمامی ارزیابی‌ها و سوابق متصل به این پرسنل را پاکسازی می‌کند و غیرقابل بازگشت است.
+                فقط پرونده‌های پرسنلی مجاز حذف می‌شوند؛ کارکنان دارای سابقه ارزیابی، پرونده باز یا رابطه سازمانی محافظت می‌شوند. حذف پرونده پرسنلی غیرقابل بازگشت است.
               </span>
             </div>
 
@@ -1581,6 +1589,7 @@ export default function Employees({
               <button
                 type="button"
                 onClick={() => setIsBulkDeleteModalOpen(false)}
+                disabled={isDeleting}
                 className="px-4 py-2 rounded-xl text-xs font-bold text-slate-400 hover:text-slate-200 bg-slate-800 hover:bg-slate-700 transition-all cursor-pointer"
               >
                 انصراف
@@ -1588,12 +1597,14 @@ export default function Employees({
               <button
                 type="button"
                 onClick={handleConfirmBulkDelete}
+                disabled={isDeleting}
                 className="px-5 py-2 rounded-xl text-xs font-bold text-white bg-rose-600 hover:bg-rose-700 transition-all cursor-pointer shadow-lg shadow-rose-600/20 flex items-center gap-1.5"
               >
                 <Trash2 className="w-3.5 h-3.5" />
                 <span>تایید و حذف گروهی ({selectedEmpIds.size} نفر)</span>
               </button>
             </div>
+            {deleteError && <div role="alert" className="rounded-xl border border-rose-500/20 bg-rose-500/10 p-3 text-xs text-rose-300">{deleteError}</div>}
           </div>
         </div>,
         document.body
@@ -1609,3 +1620,5 @@ export default function Employees({
     </div>
   );
 }
+
+

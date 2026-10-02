@@ -133,6 +133,21 @@ function parseCsv(text: string): ExcelCell[][] {
 }
 
 export async function readWorkbookRows(file: File): Promise<ParsedWorkbook> {
+  if (typeof window === 'undefined' || typeof Worker === 'undefined') return readWorkbookRowsLocally(file);
+  return new Promise((resolve, reject) => {
+    const worker = new Worker(new URL('./excelWorkbook.worker.ts', import.meta.url), { type: 'module' });
+    const finish = () => worker.terminate();
+    worker.onmessage = event => {
+      finish();
+      if (typeof event.data.parseMs === 'number') window.dispatchEvent(new CustomEvent('pe_import_parse_measurement', { detail: { parseMs: event.data.parseMs } }));
+      event.data.error ? reject(new Error(event.data.error)) : resolve(event.data.result);
+    };
+    worker.onerror = () => { finish(); reject(new Error('پردازش فایل متوقف شد؛ فایل را دوباره انتخاب کنید.')); };
+    worker.postMessage(file);
+  });
+}
+
+export async function readWorkbookRowsLocally(file: File): Promise<ParsedWorkbook> {
   if (file.name.toLowerCase().endsWith('.csv')) {
     const name = 'CSV';
     return { sheets: [name], rowsBySheet: { [name]: parseCsv(await file.text()) } };

@@ -3,7 +3,9 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-import React from 'react';
+import React, { useState, useRef, useEffect } from 'react';
+import { calibrationCounts } from '../utils/calibrationState';
+import { previewBulkAdvance, buildBulkAdvanceUpdates } from '../utils/bulkWorkflow';
 import { calculateFinalScore } from '../utils/formulaEngine';
 import { 
   Scale, 
@@ -21,6 +23,8 @@ interface CalibrationProps {
   evaluations: Evaluation[];
   employees: Employee[];
   profiles: JobProfile[];
+  currentUser: Employee;
+  onBulkUpdateEvaluations: (records: Evaluation[]) => boolean | Promise<boolean>;
   onUpdateEvaluation: (id: string, ev: Evaluation) => void;
   onSelectEvaluation: (id: string) => void;
 }
@@ -29,6 +33,8 @@ export default function Calibration({
   evaluations,
   employees,
   profiles,
+  currentUser,
+  onBulkUpdateEvaluations,
   onUpdateEvaluation,
   onSelectEvaluation
 }: CalibrationProps) {
@@ -38,14 +44,13 @@ export default function Calibration({
     return hasScores;
   });
 
-  const readyForCalibration = evaluations.filter(ev => {
-    return ev.status === 'draft' && ev.scores.every(s => s.value > 0);
-  });
+  const { ready: readyForCalibration, approved: calibratedCount, completed: lockedCount } = calibrationCounts(evaluations);
+  const [page, setPage] = useState(0);
+  useEffect(() => setPage(current => Math.min(current, Math.max(0, Math.ceil(readyForCalibration.length / 50) - 1))), [readyForCalibration.length]);
+  const [error, setError] = useState('');
+  const saving = useRef(false);
+  const [isSaving, setIsSaving] = useState(false);
 
-  const calibratedCount = evaluations.filter(ev => ev.status === 'calibrated').length;
-  const lockedCount = evaluations.filter(ev => ev.status === 'locked').length;
-
-  
   // Grade Distribution
   const dist = { A: 0, B: 0, C: 0, D: 0, E: 0 };
   scoredEvals.forEach(ev => {
@@ -59,8 +64,16 @@ export default function Calibration({
   // Guidelines recommendation: A should be around 10-15%, B around 20-30%, C around 40-50%...
   const isInflated = aPercentage > 25;
 
-  const handleApproveCalibration = (ev: Evaluation) => {
-    onUpdateEvaluation(ev.id, { ...ev, status: 'calibrated' });
+  const handleApproveCalibration = async (ev: Evaluation) => {
+    if (saving.current) return;
+    const preview = previewBulkAdvance([ev.id], evaluations, currentUser, employees);
+    const updates = buildBulkAdvanceUpdates(preview.rows, evaluations, employees, currentUser);
+    if (!updates.length) { setError('مجوز یا وضعیت پرونده برای تأیید کالیبراسیون معتبر نیست.'); return; }
+    saving.current = true; setIsSaving(true); setError('');
+    try {
+      const byId = new Map(updates.map(record => [record.id, record]));
+      if ((await onBulkUpdateEvaluations(evaluations.map(record => byId.get(record.id) || record))) !== true) setError('سرور تأیید کالیبراسیون را نپذیرفت؛ پرونده در صف باقی ماند.');
+    } finally { saving.current = false; setIsSaving(false); }
   };
 
   return (
@@ -165,6 +178,9 @@ export default function Calibration({
       <div className="bg-white/80 border border-slate-200 dark:bg-slate-900/70 dark:border-slate-800 rounded-2xl overflow-hidden p-5 space-y-4 shadow-sm">
         <h3 className="text-sm font-bold text-slate-800 dark:text-slate-200">ارزیابی‌های نیازمند هم‌ترازسازی و تایید کالیبراسیون</h3>
 
+        {error && <p role="alert" className="text-rose-500">{error}</p>}
+        <p data-calibration-count>آماده کمیته: {readyForCalibration.length} · تأیید کمیته: {calibratedCount} · نهایی: {lockedCount}</p>
+        {readyForCalibration.length > 50 && <div className="flex gap-4"><button disabled={page === 0} onClick={() => setPage(page - 1)}>صفحه قبل</button><span>{page + 1} / {Math.ceil(readyForCalibration.length / 50)}</span><button disabled={(page + 1) * 50 >= readyForCalibration.length} onClick={() => setPage(page + 1)}>صفحه بعد</button></div>}
         {readyForCalibration.length > 0 ? (
           <div className="overflow-x-auto">
             <table className="w-full text-xs text-slate-700 dark:text-slate-300">
@@ -179,7 +195,7 @@ export default function Calibration({
                 </tr>
               </thead>
               <tbody className="divide-y divide-slate-200 dark:divide-slate-800/60">
-                {readyForCalibration.map((ev) => {
+                {readyForCalibration.slice(page * 50, page * 50 + 50).map((ev) => {
                   const emp = employees.find(e => e.id === ev.empId);
                   const prof = profiles.find(p => p.id === ev.profileId);
                   const score = calculateFinalScore(ev, profiles);
@@ -207,7 +223,7 @@ export default function Calibration({
                           </button>
                           
                           <button
-                            onClick={() => handleApproveCalibration(ev)}
+                            disabled={isSaving} onClick={() => handleApproveCalibration(ev)}
                             className="min-h-9 px-2.5 py-1.5 bg-teal-600 hover:bg-teal-700 text-white rounded-lg text-[10px] font-bold transition-colors flex items-center gap-1 cursor-pointer"
                           >
                             <Scale className="w-3 h-3" />
@@ -232,3 +248,4 @@ export default function Calibration({
     </div>
   );
 }
+

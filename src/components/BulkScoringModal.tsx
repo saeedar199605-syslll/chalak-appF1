@@ -1,5 +1,5 @@
 import SearchInput from './ui/SearchInput';
-import React, { useMemo, useState } from 'react';
+import React, { useMemo, useState, useRef, useEffect } from 'react';
 import { AlertTriangle, CheckCircle2, Search, X } from 'lucide-react';
 import type { Criterion, Employee, Evaluation, JobProfile } from '../types';
 import { manualScoreRange } from '../utils/criterionScoring';
@@ -13,7 +13,7 @@ interface BulkScoringModalProps {
   profiles: JobProfile[];
   criteria: Criterion[];
   currentUser: Employee;
-  onSave: (evaluations: Evaluation[]) => void;
+  onSave: (evaluations: Evaluation[], sourceImport?: undefined, operationId?: string) => boolean | Promise<boolean> | void;
   onClose: () => void;
 }
 
@@ -25,8 +25,11 @@ export default function BulkScoringModal(props: BulkScoringModalProps) {
   const [scoreValue, setScoreValue] = useState('');
   const [comment, setComment] = useState('');
   const [searchTerm, setSearchTerm] = useState('');
+  const [page, setPage] = useState(0);
+
   const [matrixValues, setMatrixValues] = useState<Record<string, Record<string, number>>>({});
   const [step, setStep] = useState<'edit' | 'preview'>('edit');
+  useEffect(() => setPage(0), [searchTerm, mode, step]);
   const [operationId] = useState(() => typeof crypto !== 'undefined' && 'randomUUID' in crypto ? crypto.randomUUID() : `bulk-${Date.now()}`);
 
   const evaluationById = useMemo(() => new Map(evaluations.map(evaluation => [evaluation.id, evaluation])), [evaluations]);
@@ -65,11 +68,20 @@ export default function BulkScoringModal(props: BulkScoringModalProps) {
     profileById.get(evaluation.profileId)?.items.some(item => item.cid === criterion.id)
   ));
 
-  const confirmSave = () => {
+  const submitting = useRef(false);
+  const [saving, setSaving] = useState(false);
+  const [saveError, setSaveError] = useState('');
+  const confirmSave = async () => {
     if (!plan.updatedEvaluations.length) return;
     const changedById = new Map<string, Evaluation>(plan.updatedEvaluations.map(evaluation => [evaluation.id, evaluation]));
-    props.onSave(evaluations.map(evaluation => changedById.get(evaluation.id) || evaluation));
-    props.onClose();
+    if (submitting.current) return;
+    submitting.current = true; setSaving(true); setSaveError('');
+    try {
+      const accepted = await props.onSave(evaluations.map(evaluation => changedById.get(evaluation.id) || evaluation), undefined, operationId);
+      if (accepted !== true) { setSaveError('سرور ذخیره را تأیید نکرد؛ پیش‌نمایش حفظ شد. مجوز، اتصال یا تعارض نسخه را بررسی کنید.'); return; }
+      props.onClose();
+    } catch { setSaveError('ذخیره ابری انجام نشد؛ پیش‌نمایش برای تلاش کنترل‌شده حفظ شد.'); }
+    finally { submitting.current = false; setSaving(false); }
   };
 
   const editScoreCell = (evaluationId: string, cid: string, value: string) => {
@@ -89,9 +101,10 @@ export default function BulkScoringModal(props: BulkScoringModalProps) {
             <h2 id="bulk-score-title" className="text-base font-black">امتیازدهی گروهی</h2>
             <p className="mt-1 text-xs text-slate-400">{uniqueIds.length} پرونده انتخاب شده؛ بررسی اختیار و محدوده برای هر پرونده جداگانه انجام می‌شود.</p>
           </div>
-          <button type="button" aria-label="بستن" onClick={props.onClose} className="rounded-xl p-2 text-slate-400 hover:bg-slate-800 hover:text-white"><X className="h-5 w-5" /></button>
+          <button type="button" aria-label="بستن" disabled={saving} onClick={props.onClose} className="rounded-xl p-2 text-slate-400 hover:bg-slate-800 hover:text-white"><X className="h-5 w-5" /></button>
         </div>
 
+        <div className="flex gap-4 px-5 py-2 text-xs" aria-label="صفحات امتیازدهی"><button disabled={page === 0} onClick={() => setPage(page - 1)}>صفحه قبل</button><span>{page + 1} / {Math.max(1, Math.ceil((step === 'preview' ? plan.rows.length : visibleSelectedEvaluations.length) / 50))}</span><button disabled={(page + 1) * 50 >= (step === 'preview' ? plan.rows.length : visibleSelectedEvaluations.length)} onClick={() => setPage(page + 1)}>صفحه بعد</button></div>
         <div className="flex flex-wrap items-center gap-2 border-b border-slate-800 px-5 py-3">
           <button type="button" onClick={() => { setMode('same'); setStep('edit'); }} className={`rounded-xl border px-3 py-2 text-xs font-bold ${mode === 'same' ? 'border-teal-500/50 bg-teal-500/10 text-teal-200' : 'border-slate-700 text-slate-300'}`}>یک نمره برای همه</button>
           <button type="button" onClick={() => { setMode('matrix'); setStep('edit'); }} className={`rounded-xl border px-3 py-2 text-xs font-bold ${mode === 'matrix' ? 'border-teal-500/50 bg-teal-500/10 text-teal-200' : 'border-slate-700 text-slate-300'}`}>جدول نمره‌دهی</button>
@@ -125,7 +138,7 @@ export default function BulkScoringModal(props: BulkScoringModalProps) {
               </div>
             ) : null}
             {mode === 'same' && searchTerm.trim() && <div className="flex flex-wrap gap-2 rounded-xl border border-slate-800 bg-slate-950/70 p-3 text-[10px] text-slate-300" aria-label="نتایج کارکنان انتخاب‌شده">
-              {visibleSelectedEvaluations.map(evaluation => { const employee = employeeById.get(evaluation.empId); return <span key={evaluation.id} className="rounded-lg bg-slate-800 px-2 py-1">{employee?.name} · {employee?.code}</span>; })}
+              {visibleSelectedEvaluations.slice(page * 50, page * 50 + 50).map(evaluation => { const employee = employeeById.get(evaluation.empId); return <span key={evaluation.id} className="rounded-lg bg-slate-800 px-2 py-1">{employee?.name} · {employee?.code}</span>; })}
               {!visibleSelectedEvaluations.length && <span className="text-slate-500">موردی پیدا نشد.</span>}
             </div>}
             {mode === 'matrix' && uniqueIds.length > 100 ? (
@@ -135,7 +148,7 @@ export default function BulkScoringModal(props: BulkScoringModalProps) {
                 <table className="min-w-full border-collapse text-right text-[11px]">
                   <thead className="sticky top-0 bg-slate-950 text-slate-300"><tr><th className="min-w-52 p-2">کارمند</th>{matrixCriteria.map(criterion => <th key={criterion.id} className="min-w-28 p-2">{criterion.name}</th>)}</tr></thead>
                   <tbody>
-                    {visibleSelectedEvaluations.map(evaluation => {
+                    {visibleSelectedEvaluations.slice(page * 50, page * 50 + 50).map(evaluation => {
                       const employee = employeeById.get(evaluation.empId);
                       const profile = profileById.get(evaluation.profileId);
                       return <tr key={evaluation.id} className="border-t border-slate-800">
@@ -169,20 +182,23 @@ export default function BulkScoringModal(props: BulkScoringModalProps) {
             </div>
             <div className="overflow-auto rounded-2xl border border-slate-800">
               <table className="min-w-full text-right text-[11px]"><thead className="bg-slate-950 text-slate-300"><tr><th className="p-2">کارمند</th><th className="p-2">پرونده</th><th className="p-2">نتیجه</th></tr></thead>
-                <tbody>{plan.rows.map(row => <tr key={row.evaluationId} className="border-t border-slate-800"><td className="p-2">{row.employeeName}</td><td className="p-2 font-mono text-slate-500">{row.evaluationId}</td><td className={`p-2 ${row.eligible ? 'text-emerald-300' : 'text-rose-300'}`}>{row.eligible ? <CheckCircle2 className="ml-1 inline h-3.5 w-3.5" /> : <AlertTriangle className="ml-1 inline h-3.5 w-3.5" />}{row.reasonLabel}</td></tr>)}</tbody>
+                <tbody>{plan.rows.slice(page * 50, page * 50 + 50).map(row => <tr key={row.evaluationId} className="border-t border-slate-800"><td className="p-2">{row.employeeName}</td><td className="p-2 font-mono text-slate-500">{row.evaluationId}</td><td className={`p-2 ${row.eligible ? 'text-emerald-300' : 'text-rose-300'}`}>{row.eligible ? <CheckCircle2 className="ml-1 inline h-3.5 w-3.5" /> : <AlertTriangle className="ml-1 inline h-3.5 w-3.5" />}{row.reasonLabel}</td></tr>)}</tbody>
               </table>
             </div>
           </div>
         )}
 
+        {saving && <p role="status" className="px-5 text-teal-300">در حال ذخیره ابری و بررسی تأیید سرور…</p>}
+        {saveError && <p role="alert" className="px-5 text-rose-300">{saveError}</p>}
         <div className="flex items-center justify-between gap-2 border-t border-slate-800 px-5 py-4">
-          <button type="button" onClick={props.onClose} className="rounded-xl border border-slate-700 px-4 py-2 text-xs font-bold text-slate-300">انصراف</button>
+          <button type="button" onClick={props.onClose} disabled={saving} className="rounded-xl border border-slate-700 px-4 py-2 text-xs font-bold text-slate-300">انصراف</button>
           <div className="flex gap-2">
-            {step === 'preview' && <button type="button" onClick={() => setStep('edit')} className="rounded-xl border border-slate-700 px-4 py-2 text-xs font-bold text-slate-200">بازگشت به ویرایش</button>}
-            {step === 'edit' ? <button type="button" onClick={() => setStep('preview')} disabled={!plan.rows.some(row => row.reason !== 'no_score_input')} className="rounded-xl bg-teal-500 px-4 py-2 text-xs font-black text-slate-950 disabled:opacity-40">پیش‌نمایش و بررسی مجوز</button> : <button type="button" onClick={confirmSave} disabled={!plan.updatedEvaluations.length} className="rounded-xl bg-emerald-500 px-4 py-2 text-xs font-black text-slate-950 disabled:opacity-40">تأیید و ذخیره {plan.eligible} پرونده</button>}
+            {step === 'preview' && <button type="button" onClick={() => setStep('edit')} disabled={saving} className="rounded-xl border border-slate-700 px-4 py-2 text-xs font-bold text-slate-200">بازگشت به ویرایش</button>}
+            {step === 'edit' ? <button type="button" onClick={() => setStep('preview')} disabled={!plan.rows.some(row => row.reason !== 'no_score_input')} className="rounded-xl bg-teal-500 px-4 py-2 text-xs font-black text-slate-950 disabled:opacity-40">پیش‌نمایش و بررسی مجوز</button> : <button type="button" onClick={confirmSave} disabled={saving || !plan.updatedEvaluations.length} className="rounded-xl bg-emerald-500 px-4 py-2 text-xs font-black text-slate-950 disabled:opacity-40">تأیید و ذخیره {plan.eligible} پرونده</button>}
           </div>
         </div>
       </div>
     </div>
   );
 }
+

@@ -4,7 +4,7 @@ import SearchInput from './ui/SearchInput';
  * SPDX-License-Identifier: Apache-2.0
  */
 
-import React, { useState, useMemo, useEffect } from 'react';
+import React, { useState, useMemo, useEffect, useRef } from 'react';
 import { calculateFinalScore, evaluateNumericFormula } from '../utils/formulaEngine';
 import { createPortal } from 'react-dom';
 import { 
@@ -125,12 +125,12 @@ interface EvaluationsProps {
   profiles: JobProfile[];
   criteria: Criterion[];
   onAddEvaluation: (empId: string, period: string) => void;
-  onBulkStartEvaluations?: (employeeIds: string[], period: string) => boolean;
+  onBulkStartEvaluations?: (employeeIds: string[], period: string) => boolean | Promise<boolean>;
   onActivateEvaluationPeriod?: (period: string) => boolean;
   onUpdateEvaluation: (id: string, ev: Evaluation) => void;
-  onBulkUpdateEvaluations?: (evals: Evaluation[], sourceImport?: import('../utils/sourceImports').ProtectedSourceImportContext) => boolean | Promise<boolean> | void;
+  onBulkUpdateEvaluations?: (evals: Evaluation[], sourceImport?: import('../utils/sourceImports').ProtectedSourceImportContext, operationId?: string) => boolean | Promise<boolean> | void;
   onDeleteEvaluation: (id: string) => void;
-  onBulkDeleteEvaluations?: (ids: string[]) => void;
+  onBulkDeleteEvaluations?: (ids: string[]) => boolean | Promise<boolean>;
   onNavigateToWorkflow?: () => void;
   activeEvalId: string | null;
   onSetActiveEval: (id: string | null) => void;
@@ -206,14 +206,15 @@ export default function Evaluations({
   const [evalToDelete, setEvalToDelete] = useState<Evaluation | null>(null);
   const [isBulkDeleteConfirmOpen, setIsBulkDeleteConfirmOpen] = useState(false);
 
-  const handleConfirmBulkDelete = () => {
+  const handleConfirmBulkDelete = async () => {
     if (selectedEvalIds.size === 0) return;
     if (onBulkDeleteEvaluations) {
-      onBulkDeleteEvaluations(Array.from(selectedEvalIds));
+      if ((await onBulkDeleteEvaluations(Array.from(selectedEvalIds))) !== true) { alert('سرور حذف گروهی را تأیید نکرد؛ انتخاب‌ها حفظ شدند.'); return; }
     } else {
       selectedEvalIds.forEach(id => onDeleteEvaluation(id));
     }
-    setSelectedEvalIds(new Set());
+    const persistedIds = new Set(db.getEvaluations().map(e => e.id));
+    setSelectedEvalIds(new Set<string>([...selectedEvalIds].filter(id => persistedIds.has(id))));
     setIsBulkDeleteConfirmOpen(false);
   };
 
@@ -260,24 +261,30 @@ export default function Evaluations({
   const persistedActiveEval = evaluations.find(e => e.id === activeEvalId);
   const activeEval = persistedActiveEval ? scoreDrafts[persistedActiveEval.id] || persistedActiveEval : undefined;
   const isActiveDraftDirty = Boolean(activeEval && persistedActiveEval && JSON.stringify(activeEval) !== JSON.stringify(persistedActiveEval));
+  const draftSubmitting = useRef(false);
+  const draftOperationId = useRef(crypto.randomUUID());
   const updateActiveDraft = (update: (evaluation: Evaluation) => Evaluation) => {
-    if (!persistedActiveEval) return;
+    if (!persistedActiveEval || draftSubmitting.current) return;
+    draftOperationId.current = crypto.randomUUID();
     setScoreDrafts(current => ({
       ...current,
       [persistedActiveEval.id]: update(current[persistedActiveEval.id] || persistedActiveEval),
     }));
     setScoreDraftError('');
   };
-  const saveActiveDraft = () => {
-    if (!activeEval || !persistedActiveEval || !isActiveDraftDirty) return;
+  const saveActiveDraft = async () => {
+    if (!activeEval || !persistedActiveEval || !isActiveDraftDirty || draftSubmitting.current) return;
+    draftSubmitting.current = true;
+    try {
     const updated = evaluations.map(evaluation => evaluation.id === activeEval.id ? activeEval : evaluation);
-    if (onBulkUpdateEvaluations) onBulkUpdateEvaluations(updated);
-    else onUpdateEvaluation(activeEval.id, activeEval);
+    const accepted = onBulkUpdateEvaluations ? await onBulkUpdateEvaluations(updated, undefined, draftOperationId.current) : false;
+    if (accepted !== true) { setScoreDraftError('سرور ذخیره نمرات را تأیید نکرد؛ نمرات پیش‌نویس حفظ شدند.'); return; }
     setScoreDrafts(current => {
       const next = { ...current };
       delete next[activeEval.id];
       return next;
     });
+    } finally { draftSubmitting.current = false; }
   };
   const activeEmployee = employees.find(emp => emp?.id === activeEval?.empId);
   const activeProfile = profiles.find(p => p?.id === activeEval?.profileId);
@@ -362,7 +369,7 @@ export default function Evaluations({
     setIsNewModalOpen(true);
   };
 
-  const handleCreateEvaluation = (e: React.FormEvent) => {
+  const handleCreateEvaluation = async (e: React.FormEvent) => {
     e.preventDefault();
     const selectedIds: string[] = [...startSelection];
     if (!selectedIds.length || !newPeriod.trim() || !isAdmin || activePeriod.trim() !== newPeriod.trim()) return;
@@ -370,7 +377,7 @@ export default function Evaluations({
     const preview = previewEvaluationStart(selectedIds, newPeriod, employees, profiles, evaluations);
     if (!preview.eligible) return;
     if (onBulkStartEvaluations) {
-      if (!onBulkStartEvaluations(selectedIds, newPeriod.trim())) return;
+      if (!(await onBulkStartEvaluations(selectedIds, newPeriod.trim()))) return;
     } else {
       preview.rows.filter(row => row.reason === 'eligible').forEach(row => onAddEvaluation(row.employeeId, newPeriod.trim()));
     }
@@ -1862,3 +1869,5 @@ export default function Evaluations({
     </div>
   );
 }
+
+

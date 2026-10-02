@@ -759,21 +759,20 @@ export default function App() {
       alert('حذف اطلاعات ورود گروهی از سرور ناموفق بود؛ عملیات گروهی متوقف شد.');
       return false;
     }
-    const res = db.deleteEmployeesBatch(targets.map(target => target.id));
-    if (res.success) {
-      setEmployees(db.getEmployees());
-      setEvaluations(db.getEvaluations());
-      notifyDataSaved();
-      if (blockedCount) alert(`${res.deletedCount} کارمند حذف شد؛ ${blockedCount} مورد به‌دلیل سابقه، پرونده باز، رابطه سازمانی یا حساب محافظت‌شده باقی ماند.`);
-      return true;
-    }
-    return false;
-  };
-
-  const handleBulkUpdateEmployees = (updatedList: Employee[]) => {
-    db.saveEmployees(updatedList);
+    const remaining = employees.filter(employee => !deletionPlan.deletableIds.has(employee.id));
+    const accepted = await db.commitBulkState({ pe_employees: remaining }, crypto.randomUUID(), { pe_employees: JSON.stringify(employees) });
+    if (!accepted) return false;
     setEmployees(db.getEmployees());
     notifyDataSaved();
+    if (blockedCount) alert(`${targets.length} کارمند حذف شد؛ ${blockedCount} مورد به‌دلیل سابقه، پرونده باز، رابطه سازمانی یا حساب محافظت‌شده باقی ماند.`);
+    return true;
+  };
+
+  const handleBulkUpdateEmployees = async (updatedList: Employee[], operationId?: string): Promise<boolean> => {
+    if (!(await db.commitBulkState({ pe_employees: updatedList }, operationId || crypto.randomUUID(), { pe_employees: JSON.stringify(employees) }))) return false;
+    setEmployees(db.getEmployees());
+    notifyDataSaved();
+    return true;
   };
 
   const handleImportEmployees = async (
@@ -787,16 +786,14 @@ export default function App() {
     return true;
   };
 
-  const handleBulkUpdateEvaluations = async (updatedEvals: Evaluation[], sourceImport?: import('./utils/sourceImports').ProtectedSourceImportContext): Promise<boolean> => {
-    if (sourceImport) {
-      const accepted = await db.saveEvaluationsWithSourceImport(updatedEvals, sourceImport);
-      if (!accepted) return false;
-      setEvaluations(db.getEvaluations());
-      notifyDataSaved();
-      return true;
-    }
-    db.saveEvaluations(updatedEvals);
-    setEvaluations(updatedEvals);
+  const handleBulkUpdateEvaluations = async (updatedEvals: Evaluation[], sourceImport?: import('./utils/sourceImports').ProtectedSourceImportContext, operationId?: string): Promise<boolean> => {
+    const before = new Map(evaluations.map(record => [record.id, record]));
+    const changes = updatedEvals.filter(record => JSON.stringify(record) !== JSON.stringify(before.get(record.id)));
+    if (!changes.length) return false;
+    const ids = new Set(changes.map(record => record.id));
+    const accepted = await db.commitEvaluationChanges(changes, operationId || sourceImport?.operationId || crypto.randomUUID(), sourceImport, evaluations.filter(record => ids.has(record.id)));
+    if (!accepted) return false;
+    setEvaluations(db.getEvaluations());
     notifyDataSaved();
     return true;
   };
@@ -836,14 +833,14 @@ export default function App() {
     return true;
   };
 
-  const handleBulkStartEvaluations = (employeeIds: string[], period: string): boolean => {
+  const handleBulkStartEvaluations = async (employeeIds: string[], period: string): Promise<boolean> => {
     if (currentUser?.role !== 'admin' || !isEvaluationPeriodActive(db.getMiscData<string>('pe_active_period', ''), period)) return false;
     const routeRules = db.getMiscData('pe_route_rules', DEFAULT_ROUTE_RULES);
     const newEvaluations = buildEvaluationStarts(employeeIds, period, employees, profiles, evaluations, Date.now(), routeRules);
     if (!newEvaluations.length) return false;
     const next = [...evaluations, ...newEvaluations];
-    db.saveEvaluations(next);
-    setEvaluations(next);
+    if (!(await db.commitEvaluationChanges(newEvaluations, crypto.randomUUID()))) return false;
+    setEvaluations(db.getEvaluations());
     setActiveEvalId(newEvaluations[0].id);
     setCurrentTab('evaluations');
     notifyDataSaved();
@@ -901,15 +898,19 @@ export default function App() {
     }
   };
 
-  const handleBulkDeleteEvaluations = (ids: string[]) => {
-    const res = db.deleteEvaluationsBatch(ids);
-    if (res.deletedCount > 0) {
+  const handleBulkDeleteEvaluations = async (ids: string[]): Promise<boolean> => {
+    const selected = new Set(ids);
+    const remaining = evaluations.filter(e => !selected.has(e.id) || e.status === 'locked' || e.stage === 'completed');
+    if (remaining.length === evaluations.length) return false;
+    if (await db.commitBulkState({ pe_evaluations: remaining }, crypto.randomUUID(), { pe_evaluations: JSON.stringify(evaluations) })) {
       setEvaluations(db.getEvaluations());
-      if (activeEvalId && ids.includes(activeEvalId)) {
+      if (activeEvalId && !remaining.some(e => e.id === activeEvalId)) {
         setActiveEvalId(null);
       }
       notifyDataSaved();
+      return true;
     }
+    return false;
   };
 
   const handleStartEvaluationDirect = (empId: string) => {
@@ -1143,6 +1144,7 @@ export default function App() {
 
         <div className="app-content px-4 py-5 sm:px-6 sm:py-6 xl:px-8 xl:py-8">
           <div className="app-page mx-auto max-w-[88rem] space-y-7">
+         {db.hasPendingBulkOperation() && <div role="status" className="rounded-xl border border-amber-500 p-3 text-sm">عملیات گروهی تأییدنشده برای این حساب حفظ شده است. <button disabled={cloudStatus.status === 'syncing'} onClick={async () => { if (await db.retryPendingBulkOperation()) { setEmployees(db.getEmployees()); setEvaluations(db.getEvaluations()); notifyDataSaved(); } }} className="mr-3 underline">بررسی و تلاش دوباره عملیات گروهی</button></div>}
           <Suspense key={currentUser.id} fallback={<div className="p-8 text-center text-sm text-slate-400">در حال بارگذاری بخش…</div>}>
           {currentTab === 'dashboard' && <Dashboard criteria={criteria} profiles={profiles} employees={employees} evaluations={evaluations} onNavigate={setCurrentTab} onSelectEvaluation={handleSelectEvaluation} currentUser={currentUser} hasCertifiedBadge={hasCertifiedBadge} theme={theme} />}
           {currentTab === 'workflow' && (
@@ -1197,7 +1199,7 @@ export default function App() {
           {currentTab === 'employees' && <Employees employees={employees} profiles={profiles} evaluations={evaluations} currentUser={currentUser} onAddEmployee={handleAddEmployee} onUpdateEmployee={handleUpdateEmployee} onBulkUpdateEmployees={handleBulkUpdateEmployees} onImportEmployees={handleImportEmployees} onDeleteEmployee={handleDeleteEmployee} onBulkDeleteEmployees={handleBulkDeleteEmployees} onStartEvaluation={handleStartEvaluationDirect} theme={theme} />}
           {currentTab === 'evaluations' && <Evaluations evaluations={evaluations} employees={employees} profiles={profiles} criteria={criteria} onAddEvaluation={handleAddEvaluation} onActivateEvaluationPeriod={handleActivateEvaluationPeriod} onBulkStartEvaluations={handleBulkStartEvaluations} onUpdateEvaluation={handleUpdateEvaluation} onBulkUpdateEvaluations={handleBulkUpdateEvaluations} onDeleteEvaluation={handleDeleteEvaluation} onBulkDeleteEvaluations={handleBulkDeleteEvaluations} activeEvalId={activeEvalId} onSetActiveEval={setActiveEvalId} onNavigateToWorkflow={() => setCurrentTab('workflow')} currentUser={currentUser} />}
           {currentTab === 'imports' && <ExcelIntegrationCenter embedded isOpen onClose={() => setCurrentTab('dashboard')} employees={employees} profiles={profiles} criteria={criteria} evaluations={evaluations} currentUser={currentUser} onUpdateEvaluations={handleBulkUpdateEvaluations} onAddEvaluation={handleAddEvaluation} />}
-          {currentTab === 'calibration' && <Calibration evaluations={evaluations} employees={employees} profiles={profiles} onUpdateEvaluation={handleUpdateEvaluation} onSelectEvaluation={handleSelectEvaluation} />}
+          {currentTab === 'calibration' && <Calibration currentUser={currentUser} onBulkUpdateEvaluations={handleBulkUpdateEvaluations} evaluations={evaluations} employees={employees} profiles={profiles} onUpdateEvaluation={handleUpdateEvaluation} onSelectEvaluation={handleSelectEvaluation} />}
           {currentTab === 'support' && <SupportTickets currentUser={currentUser} theme={theme} />}
           {currentTab === 'reports' && (
             <Reports 
@@ -1379,3 +1381,5 @@ export default function App() {
     </div>
   );
 }
+
+

@@ -5,7 +5,7 @@ import { hasRequiredFinalizationInputs } from './workflowSecurity';
 import { resolveWorkflowAssignee } from './workflowAssignee';
 import type { GranularPermissionPolicy } from './authorization';
 
-export type BulkAdvanceReason = 'eligible' | 'not_owned' | 'wrong_state' | 'missing_input' | 'permission_denied' | 'already_transitioned';
+export type BulkAdvanceReason = 'eligible' | 'not_owned' | 'wrong_state' | 'missing_input' | 'missing_assignee' | 'permission_denied' | 'already_transitioned';
 export type BulkAdvanceRow = {
   evaluationId: string;
   employeeId: string;
@@ -82,6 +82,8 @@ export function previewBulkAdvance(
       const wrongOwner = Boolean(evaluation.currentAssigneeId && evaluation.currentAssigneeId !== actor.id && !allowed.delegation);
       return { ...base, reason: wrongOwner ? 'not_owned' as const : 'permission_denied' as const };
     }
+    const owner = resolveWorkflowAssignee(target, employee, employees);
+    if (target !== 'completed' && !employeesById.has(owner.id)) return { ...base, reason: 'missing_assignee' as const };
     return { ...base, reason: 'eligible' as const };
   });
   return { selected: rows.length, eligible: rows.filter(row => row.reason === 'eligible').length, rows };

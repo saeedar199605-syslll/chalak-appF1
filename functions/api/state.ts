@@ -29,6 +29,8 @@ interface StateEnvelope {
   baseRevision?: unknown;
   clientId?: unknown;
   sourceImport?: unknown;
+  operationId?: unknown;
+  evaluationPatch?: unknown;
 }
 
 const NON_ADMIN_WRITABLE_KEYS = new Set([
@@ -63,6 +65,13 @@ async function readState(env: CloudflareEnv): Promise<{ state: CloudState; meta:
       clientId: typeof parsed.clientId === 'string' ? parsed.clientId : undefined,
     };
   } catch { /* legacy state starts at revision zero */ }
+  // A bulk receipt and its records share one KV value. Recover metadata if the
+  // subsequent meta write failed after that value was already accepted.
+  for (const log of (Array.isArray(state.pe_audit_logs) ? state.pe_audit_logs : []) as Array<Record<string, unknown>>) {
+    if (log.action === 'bulk_operation_completed' && Number.isInteger(log.acceptedRevision) && Number(log.acceptedRevision) > meta.revision) {
+      meta = { ...meta, revision: Number(log.acceptedRevision), updatedAt: String(log.timestamp || meta.updatedAt) };
+    }
+  }
   return { state, meta };
 }
 
@@ -601,7 +610,17 @@ function scopedState(state: CloudState, session: AuthSession): CloudState {
     'pe_reward_config', 'pe_reward_batch_history', 'pe_system_logs', 'pe_audit_logs',
     'pe_role_permissions', 'pe_user_custom_permissions', 'pe_locked_users',
   ]) delete result[key];
-  return sanitizeCloudState(result);
+  // Routing contacts are read-only projections for accessible tasks, not extra
+  // employee access. Never include credentials, reporting links or employee data.
+  const contacts = new Map<string, unknown>();
+  for (const evaluation of (result.pe_evaluations || []) as Evaluation[]) {
+    const employee = employees.find(person => person.id === evaluation.empId);
+    for (const stage of ['self_review', 'supervisor_review', 'peer_review', 'calibration_review', 'hr_approval', 'hse_review', 'feedback_meeting', 'appealed'] as const) {
+      const owner = resolveWorkflowAssignee(stage, employee as Employee | undefined, employees as Employee[]);
+      if (employees.some(person => person.id === owner.id)) contacts.set(owner.id, { id: owner.id, name: owner.name, role: owner.role, code: owner.code, unit: owner.unit });
+    }
+  }
+  return { ...sanitizeCloudState(result), pe_workflow_contacts: [...contacts.values()] };
 }
 
 function mergeAuthorizedState(current: CloudState, changes: CloudState, session: AuthSession, sourceImport?: SourceImportContext): CloudState {
@@ -924,13 +943,22 @@ export async function onRequestGet({ env, data }: Context): Promise<Response> {
   return responseEnvelope(state, meta, data.session);
 }
 
-export async function onRequestPost({ request, env, data }: Context): Promise<Response> {
+let stateWriteQueue: Promise<unknown> = Promise.resolve();
+export function onRequestPost(context: Context): Promise<Response> {
+  // Serialize within this Worker instance. KV is not a cross-isolate CAS store;
+  // this must not be described as a global distributed lock.
+  const task = stateWriteQueue.then(() => writeState(context));
+  stateWriteQueue = task.catch(() => undefined);
+  return task.catch(() => jsonResponse({ error: 'ذخیره ابری کامل نشد؛ وضعیت پذیرش عملیات را با همان شناسه دوباره بررسی کنید.', retryable: true }, 503));
+}
+
+async function writeState({ request, env, data }: Context): Promise<Response> {
   if (!data.session) return jsonResponse({ error: 'Authentication required.' }, 401);
   if (!request.headers.get('Content-Type')?.toLowerCase().includes('application/json')) {
     return jsonResponse({ error: 'Content-Type must be application/json.' }, 415);
   }
   const text = await request.text();
-  if (text.length > 5_000_000) return jsonResponse({ error: 'Payload is too large.' }, 413);
+  if (new TextEncoder().encode(text).byteLength > 5_000_000) return jsonResponse({ error: 'Payload is too large.' }, 413);
 
   let body: StateEnvelope;
   try { body = JSON.parse(text) as StateEnvelope; }
@@ -940,6 +968,9 @@ export async function onRequestPost({ request, env, data }: Context): Promise<Re
     return jsonResponse({ error: 'Invalid protected import context.', code: 'source_import_invalid', reason: 'source_import_invalid', retryable: false }, 400);
   }
   const sourceImport = body.sourceImport as SourceImportContext | undefined;
+  const operationId = body.operationId ?? sourceImport?.operationId;
+  if (operationId !== undefined && (typeof operationId !== 'string' || !/^[a-zA-Z0-9:_-]{8,100}$/.test(operationId))) return jsonResponse({ error: 'Invalid operation identifier.' }, 400);
+  if (body.evaluationPatch !== undefined && typeof body.evaluationPatch !== 'boolean') return jsonResponse({ error: 'Invalid changed-set mode.' }, 400);
 
   const changes = sanitizeCloudState(body.state === undefined ? body : body.state);
   if (Object.keys(changes).length === 0) return jsonResponse({ error: 'No synchronized changes were supplied.' }, 400);
@@ -957,6 +988,13 @@ export async function onRequestPost({ request, env, data }: Context): Promise<Re
   if (data.session.role !== 'admin') delete changes.pe_system_logs;
 
   const { state: current, meta: currentMeta } = await readState(env);
+  const payloadHash = operationId ? Array.from(new Uint8Array(await crypto.subtle.digest('SHA-256', new TextEncoder().encode(JSON.stringify({ changes, sourceImport, evaluationPatch: body.evaluationPatch === true }))))).map(byte => byte.toString(16).padStart(2, '0')).join('') : undefined;
+  const receipt = operationId && (Array.isArray(current.pe_audit_logs) ? current.pe_audit_logs as Array<Record<string, unknown>> : []).find(log => log.id === `audit:bulk_operation:${operationId}` && log.actorId === data.session!.id);
+  if (receipt) {
+    if (receipt.payloadHash !== payloadHash) return jsonResponse({ error: 'این شناسه عملیات قبلاً برای تغییر دیگری استفاده شده است.', code: 'operation_id_reused', retryable: false }, 409);
+    // Receipt is stored in the same app_state value as the accepted mutation.
+    return responseEnvelope(current, currentMeta, data.session);
+  }
   const baseRevision = Number(body.baseRevision);
   if (!Number.isInteger(baseRevision) || baseRevision !== currentMeta.revision) {
     return jsonResponse({
@@ -969,6 +1007,15 @@ export async function onRequestPost({ request, env, data }: Context): Promise<Re
   // are intentionally absent from non-admin cloud state and are never accepted
   // as authoritative; acknowledge a logs-only sync without persisting or bumping revision.
   if (nonAdminSystemLogsOnly) return responseEnvelope(current, currentMeta, data.session);
+  if (body.evaluationPatch === true) {
+    if (!operationId || !Array.isArray(changes.pe_evaluations) || Object.keys(changes).some(key => key !== 'pe_evaluations')) return jsonResponse({ error: 'Changed-set operations require evaluation records only.' }, 400);
+    const updates = changes.pe_evaluations as Evaluation[];
+    const updateMap = new Map(updates.map(record => [record?.id, record]));
+    if (updateMap.size !== updates.length || updates.some(record => !record?.id)) return jsonResponse({ error: 'Duplicate or missing evaluation ID.' }, 400);
+    const records = (Array.isArray(current.pe_evaluations) ? current.pe_evaluations : []) as Evaluation[];
+    const oldIds = new Set(records.map(record => record.id));
+    changes.pe_evaluations = [...records.map(record => updateMap.get(record.id) || record), ...updates.filter(record => !oldIds.has(record.id))];
+  }
   const canonicalChanges = resolveTransitionOwners(current, changes, data.session);
   if (!hasAuthorizedEvaluationChanges(current, canonicalChanges, data.session, sourceImport)) {
     return safeWriteDenialResponse(current, canonicalChanges, data.session, sourceImport);
@@ -985,6 +1032,7 @@ export async function onRequestPost({ request, env, data }: Context): Promise<Re
     }
   }
   const next = mergeAuthorizedState(current, canonicalChanges, data.session, sourceImport);
+  if (operationId) next.pe_audit_logs = [{ id: `audit:bulk_operation:${operationId}`, action: 'bulk_operation_completed', operationId, actorId: data.session.id, actorRole: data.session.role, payloadHash, acceptedRevision: currentMeta.revision + 1, timestamp: new Date().toISOString(), result: 'accepted' }, ...(Array.isArray(next.pe_audit_logs) ? next.pe_audit_logs : [])].slice(0, 10_000);
   const meta: StateMeta = {
     revision: currentMeta.revision + 1,
     updatedAt: new Date().toISOString(),
